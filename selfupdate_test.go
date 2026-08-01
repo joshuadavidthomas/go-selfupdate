@@ -495,7 +495,7 @@ func TestApplyReportsPendingPostCommitCleanup(t *testing.T) {
 func TestApplyDetectsExecutableChangeDuringDownload(t *testing.T) {
 	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
 	fixture := releaseFixture{tag: "v2.0.0", assetName: "tool_linux_amd64.tar.gz", archive: archive}
-	u, server, target := newTestUpdater(t, fixture, "v1.0.0")
+	_, server, target := newTestUpdater(t, fixture, "v1.0.0")
 	defer server.Close()
 	fixture.archiveHook = func() {
 		if err := os.WriteFile(target, []byte("changed"), 0o700); err != nil {
@@ -505,7 +505,7 @@ func TestApplyDetectsExecutableChangeDuringDownload(t *testing.T) {
 	// The handler captured a pointer-equivalent closure only through its fixture value,
 	// so install the hook directly with a fresh server.
 	server.Close()
-	u, server, target = newTestUpdater(t, releaseFixture{
+	u, server, target := newTestUpdater(t, releaseFixture{
 		tag:       "v2.0.0",
 		assetName: "tool_linux_amd64.tar.gz",
 		archive:   archive,

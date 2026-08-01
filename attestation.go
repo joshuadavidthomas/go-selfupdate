@@ -268,7 +268,7 @@ func (u *Updater) fetchAttestationBundle(ctx context.Context, rawURL string) ([]
 	if err != nil || len(rawURL) == 0 || len(rawURL) > 4096 || !parsed.IsAbs() || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 		return nil, errors.New("selfupdate: unsafe attestation bundle URL")
 	}
-	if parsed.Scheme != "https" && !(u.allowHTTP && parsed.Scheme == "http") {
+	if parsed.Scheme != "https" && (!u.allowHTTP || parsed.Scheme != "http") {
 		return nil, errors.New("selfupdate: attestation bundle URL must use HTTPS")
 	}
 	if !strings.EqualFold(parsed.Hostname(), u.attestationBundleHost) || (!u.allowHTTP && parsed.Port() != "") {
@@ -427,7 +427,7 @@ func fetchPublicTrustedRoot() (root.TrustedMaterial, error) {
 		client: &http.Client{
 			Timeout: trustedRootHTTPTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return errors.New("Sigstore TUF redirect rejected")
+				return errors.New("sigstore TUF redirect rejected")
 			},
 		},
 	})
@@ -506,7 +506,7 @@ func validateAttestationWorkflow(workflow string) error {
 			return errors.New("selfupdate: attestation signer workflow must not contain whitespace or control characters")
 		}
 	}
-	if !(strings.HasSuffix(filename, ".yml") || strings.HasSuffix(filename, ".yaml")) {
+	if !strings.HasSuffix(filename, ".yml") && !strings.HasSuffix(filename, ".yaml") {
 		return errors.New("selfupdate: attestation signer workflow must end in .yml or .yaml")
 	}
 	base := strings.TrimSuffix(strings.TrimSuffix(filename, ".yaml"), ".yml")

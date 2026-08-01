@@ -135,7 +135,7 @@ func parseAssetDigest(value string) ([sha256.Size]byte, error) {
 	}
 	hexDigest := value[len(prefix):]
 	for _, char := range hexDigest {
-		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
 			return digest, errors.New("digest must use lowercase hexadecimal digits")
 		}
 	}
@@ -204,7 +204,7 @@ func (u *Updater) validateURL(rawURL string, api bool) error {
 		return errors.New("URL must be absolute and have no credentials or fragment")
 	}
 	if parsed.Scheme != "https" {
-		if !(u.allowHTTP && parsed.Scheme == "http") {
+		if !u.allowHTTP || parsed.Scheme != "http" {
 			return errors.New("URL must use HTTPS")
 		}
 	}

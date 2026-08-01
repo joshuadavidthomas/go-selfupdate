@@ -58,7 +58,7 @@ func extractTarGzContext(ctx context.Context, body []byte, memberName string) ([
 		if header.Name != memberName {
 			return nil, fmt.Errorf("binary member %q is not at the archive root", header.Name)
 		}
-		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+		if header.Typeflag != tar.TypeReg {
 			return nil, fmt.Errorf("binary member %q is not a regular file", header.Name)
 		}
 		if found {
