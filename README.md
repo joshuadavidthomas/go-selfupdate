@@ -160,4 +160,4 @@ On Windows, a process crash between renaming the old executable and installing t
 
 ## License
 
-MIT
+go-selfupdate is licensed under the MIT license. See the [`LICENSE`](LICENSE) file for more information.
