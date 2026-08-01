@@ -1,0 +1,4 @@
+/coverage.out
+/go-selfupdate.test
+*.exe
+*.test
