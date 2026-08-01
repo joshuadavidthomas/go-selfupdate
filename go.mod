@@ -3,7 +3,7 @@ module github.com/joshuadavidthomas/go-selfupdate
 go 1.26.5
 
 require (
-	github.com/klauspost/compress v1.18.7
+	github.com/klauspost/compress v1.19.1
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/theupdateframework/go-tuf/v2 v2.4.2
 	golang.org/x/mod v0.38.0
