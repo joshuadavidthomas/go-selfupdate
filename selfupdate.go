@@ -37,6 +37,11 @@ type AttestationPolicy struct {
 	// SignerWorkflow is one repository-relative workflow path in the form
 	// .github/workflows/<filename>.yml or .yaml.
 	SignerWorkflow string
+	// Verifier performs the cryptographic verification. Required when
+	// Attestation is set: sigstore.New() from
+	// github.com/joshuadavidthomas/go-selfupdate/sigstore is the standard
+	// implementation. New fails when Attestation is non-nil and Verifier is nil.
+	Verifier AttestationVerifier
 }
 
 // Config identifies the release and the running program.
@@ -75,7 +80,7 @@ type Updater struct {
 	httpClient          *http.Client
 	githubToken         string
 	attestationWorkflow string
-	attestationVerifier attestationVerifier
+	attestationVerifier AttestationVerifier
 	binding             [32]byte
 
 	apiBaseURL            string
@@ -161,11 +166,16 @@ func New(config Config) (*Updater, error) {
 		return nil, errors.New("selfupdate: GitHub token must not have surrounding whitespace or line breaks")
 	}
 	attestationWorkflow := ""
+	var attestationVerifier AttestationVerifier
 	if config.Attestation != nil {
 		if err := validateAttestationWorkflow(config.Attestation.SignerWorkflow); err != nil {
 			return nil, err
 		}
+		if config.Attestation.Verifier == nil {
+			return nil, errors.New("selfupdate: AttestationPolicy requires a Verifier; use sigstore.New() from github.com/joshuadavidthomas/go-selfupdate/sigstore")
+		}
 		attestationWorkflow = config.Attestation.SignerWorkflow
+		attestationVerifier = config.Attestation.Verifier
 	}
 
 	client := &http.Client{Timeout: defaultTimeout}
@@ -183,7 +193,7 @@ func New(config Config) (*Updater, error) {
 		httpClient:            client,
 		githubToken:           token,
 		attestationWorkflow:   attestationWorkflow,
-		attestationVerifier:   &sigstoreAttestationVerifier{},
+		attestationVerifier:   attestationVerifier,
 		apiBaseURL:            defaultAPIBaseURL,
 		attestationBundleHost: attestationBundleHost,
 		downloadIdleTimeout:   defaultDownloadIdleTimeout,

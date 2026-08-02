@@ -12,42 +12,20 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
-	"time"
 	"unicode"
 
 	"github.com/klauspost/compress/snappy"
-	"github.com/sigstore/sigstore-go/pkg/bundle"
-	"github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
-	"github.com/sigstore/sigstore-go/pkg/root"
-	"github.com/sigstore/sigstore-go/pkg/tuf"
-	"github.com/sigstore/sigstore-go/pkg/verify"
-	"github.com/theupdateframework/go-tuf/v2/metadata/fetcher"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
 	attestationIssuer       = "https://token.actions.githubusercontent.com"
 	attestationPredicate    = "https://slsa.dev/provenance/v1"
-	inTotoStatementV1       = "https://in-toto.io/Statement/v1"
 	attestationBundleHost   = "tmaproduction.blob.core.windows.net"
 	maxAttestationBytes     = int64(8 << 20)
 	maxCompressedBundleSize = int64(4 << 20)
 	maxAttestationPages     = 3
 	maxAttestations         = 300
-	trustedRootHTTPTimeout  = 20 * time.Second
-	trustedRootCachePeriod  = 24 * time.Hour
 )
-
-type attestationVerificationPolicy struct {
-	identity         string
-	issuer           string
-	predicate        string
-	assetName        string
-	digest           [sha256.Size]byte
-	sourceRepository string // https://github.com/<owner>/<repo>
-	sourceOwner      string // https://github.com/<owner>
-}
 
 type provenanceRecord struct {
 	owner      string
@@ -56,18 +34,6 @@ type provenanceRecord struct {
 	version    string
 	assetName  string
 	digest     [sha256.Size]byte
-}
-
-type attestationVerifier interface {
-	Verify(context.Context, []byte, attestationVerificationPolicy) error
-}
-
-type sigstoreAttestationVerifier struct {
-	mu               sync.Mutex
-	verifier         *verify.Verifier
-	verifierExpires  time.Time
-	initialize       singleflight.Group
-	fetchTrustedRoot func() (root.TrustedMaterial, error)
 }
 
 type githubAttestation struct {
@@ -79,14 +45,14 @@ type githubAttestationsResponse struct {
 }
 
 func (u *Updater) verifyAttestation(ctx context.Context, release Release, asset releaseAsset) (*provenanceRecord, error) {
-	policy := attestationVerificationPolicy{
-		identity:         "https://github.com/" + u.owner + "/" + u.repository + "/" + u.attestationWorkflow + "@refs/tags/" + release.Version,
-		issuer:           attestationIssuer,
-		predicate:        attestationPredicate,
-		assetName:        asset.name,
-		digest:           asset.digest,
-		sourceRepository: "https://github.com/" + u.owner + "/" + u.repository,
-		sourceOwner:      "https://github.com/" + u.owner,
+	request := AttestationRequest{
+		SignerIdentity:   "https://github.com/" + u.owner + "/" + u.repository + "/" + u.attestationWorkflow + "@refs/tags/" + release.Version,
+		Issuer:           attestationIssuer,
+		PredicateType:    attestationPredicate,
+		AssetName:        asset.name,
+		DigestSHA256:     asset.digest,
+		SourceRepository: "https://github.com/" + u.owner + "/" + u.repository,
+		SourceOwner:      "https://github.com/" + u.owner,
 	}
 
 	pageURL, err := u.attestationAPIURL(asset.digest)
@@ -130,7 +96,7 @@ func (u *Updater) verifyAttestation(ctx context.Context, release Release, asset 
 					return nil, fetchErr
 				}
 				firstFailure = keepFirstError(firstFailure, fmt.Errorf("external attestation bundle: %w", fetchErr))
-			} else if verifyErr := u.attestationVerifier.Verify(ctx, bundleJSON, policy); verifyErr == nil {
+			} else if verifyErr := u.attestationVerifier.VerifyAttestation(ctx, bundleJSON, request); verifyErr == nil {
 				return u.newProvenanceRecord(release, asset), nil
 			} else if isContextError(verifyErr) {
 				return nil, verifyErr
@@ -333,152 +299,6 @@ func (u *Updater) fetchAttestationBundle(ctx context.Context, rawURL string) ([]
 		return nil, fmt.Errorf("selfupdate: decompress attestation bundle: %w", err)
 	}
 	return decoded, nil
-}
-
-func buildCertificateIdentity(policy attestationVerificationPolicy) (verify.CertificateIdentity, error) {
-	sanMatcher, err := verify.NewSANMatcher(policy.identity, "")
-	if err != nil {
-		return verify.CertificateIdentity{}, err
-	}
-	issuerMatcher, err := verify.NewIssuerMatcher(policy.issuer, "")
-	if err != nil {
-		return verify.CertificateIdentity{}, err
-	}
-	return verify.NewCertificateIdentity(sanMatcher, issuerMatcher, certificate.Extensions{
-		SourceRepositoryURI:      policy.sourceRepository,
-		SourceRepositoryOwnerURI: policy.sourceOwner,
-	})
-}
-
-func (v *sigstoreAttestationVerifier) Verify(ctx context.Context, bundleJSON []byte, policy attestationVerificationPolicy) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	var signedBundle bundle.Bundle
-	if err := signedBundle.UnmarshalJSON(bundleJSON); err != nil {
-		return fmt.Errorf("parse Sigstore bundle: %w", err)
-	}
-	identity, err := buildCertificateIdentity(policy)
-	if err != nil {
-		return fmt.Errorf("build attestation identity policy: %w", err)
-	}
-	configured, err := v.configuredVerifier(ctx)
-	if err != nil {
-		return err
-	}
-	result, err := configured.Verify(&signedBundle, verify.NewPolicy(
-		verify.WithArtifactDigest("sha256", policy.digest[:]),
-		verify.WithCertificateIdentity(identity),
-	))
-	if err != nil {
-		return fmt.Errorf("verify Sigstore bundle: %w", err)
-	}
-	if result.Statement == nil || result.Statement.GetType() != inTotoStatementV1 {
-		return errors.New("verified attestation is not an in-toto Statement v1")
-	}
-	if result.Statement.GetPredicateType() != policy.predicate {
-		return fmt.Errorf("verified attestation has predicate type %q", result.Statement.GetPredicateType())
-	}
-	digestHex := hex.EncodeToString(policy.digest[:])
-	for _, subject := range result.Statement.GetSubject() {
-		if subject.GetName() == policy.assetName && subject.GetDigest()["sha256"] == digestHex {
-			return nil
-		}
-	}
-	return fmt.Errorf("verified attestation has no exact subject named %q", policy.assetName)
-}
-
-func (v *sigstoreAttestationVerifier) configuredVerifier(ctx context.Context) (*verify.Verifier, error) {
-	if configured := v.cachedVerifier(time.Now()); configured != nil {
-		return configured, nil
-	}
-	result := v.initialize.DoChan("public-root", func() (any, error) {
-		if configured := v.cachedVerifier(time.Now()); configured != nil {
-			return configured, nil
-		}
-		fetchTrustedRoot := v.fetchTrustedRoot
-		if fetchTrustedRoot == nil {
-			fetchTrustedRoot = fetchPublicTrustedRoot
-		}
-		trustedRoot, err := fetchTrustedRoot()
-		if err != nil {
-			return nil, fmt.Errorf("initialize public Sigstore verifier: %w", err)
-		}
-		configured, err := verify.NewVerifier(trustedRoot,
-			verify.WithSignedCertificateTimestamps(1),
-			verify.WithTransparencyLog(1),
-			verify.WithObserverTimestamps(1),
-			verify.WithoutStatementPredicate(),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("initialize public Sigstore verifier: %w", err)
-		}
-		v.mu.Lock()
-		v.verifier = configured
-		v.verifierExpires = time.Now().Add(trustedRootCachePeriod)
-		v.mu.Unlock()
-		return configured, nil
-	})
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case outcome := <-result:
-		if outcome.Err != nil {
-			return nil, outcome.Err
-		}
-		return outcome.Val.(*verify.Verifier), nil
-	}
-}
-
-func (v *sigstoreAttestationVerifier) cachedVerifier(now time.Time) *verify.Verifier {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.verifier == nil || !now.Before(v.verifierExpires) {
-		return nil
-	}
-	return v.verifier
-}
-
-func fetchPublicTrustedRoot() (root.TrustedMaterial, error) {
-	options := tuf.DefaultOptions().WithDisableLocalCache()
-	tufFetcher := fetcher.NewDefaultFetcher()
-	tufFetcher.SetHTTPClient(&deadlineHTTPClient{
-		deadline: time.Now().Add(trustedRootHTTPTimeout),
-		client: &http.Client{
-			Timeout: trustedRootHTTPTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return errors.New("sigstore TUF redirect rejected")
-			},
-		},
-	})
-	options.Fetcher = tufFetcher
-	return root.FetchTrustedRootWithOptions(options)
-}
-
-type deadlineHTTPClient struct {
-	client   *http.Client
-	deadline time.Time
-}
-
-func (c *deadlineHTTPClient) Do(request *http.Request) (*http.Response, error) {
-	ctx, cancel := context.WithDeadline(request.Context(), c.deadline)
-	response, err := c.client.Do(request.Clone(ctx))
-	if response == nil || response.Body == nil {
-		cancel()
-	} else {
-		response.Body = &cancelReadCloser{ReadCloser: response.Body, cancel: cancel}
-	}
-	return response, err
-}
-
-type cancelReadCloser struct {
-	io.ReadCloser
-	cancel context.CancelFunc
-}
-
-func (r *cancelReadCloser) Close() error {
-	r.cancel()
-	return r.ReadCloser.Close()
 }
 
 func keepFirstError(first, candidate error) error {

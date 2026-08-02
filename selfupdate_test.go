@@ -77,6 +77,19 @@ func TestNewValidation(t *testing.T) {
 	}
 }
 
+func TestNewRequiresAttestationVerifier(t *testing.T) {
+	t.Parallel()
+	_, err := New(Config{
+		Repository:     "owner/repo",
+		Command:        "tool",
+		CurrentVersion: "v1.0.0",
+		Attestation:    &AttestationPolicy{SignerWorkflow: ".github/workflows/release.yml"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires a Verifier") {
+		t.Fatalf("New error = %v, want error containing %q", err, "requires a Verifier")
+	}
+}
+
 func TestCheckSelectsExactStableRelease(t *testing.T) {
 	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
 	fixture := releaseFixture{tag: "v2.0.0", assetName: "tool_linux_amd64.tar.gz", archive: archive}
