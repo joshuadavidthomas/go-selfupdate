@@ -144,13 +144,17 @@ The first attestation check fetches Sigstore TUF metadata with a 20-second deadl
 
 Homebrew, system package managers, and managed installers should update the files they own. Detect those installs before calling `Apply` and direct the user to the matching upgrade command.
 
-The package leaves prompts, progress output, update schedules, install markers, caches, and downgrade policy to the CLI.
+The package leaves prompts, progress output, update schedules, install markers, caches, and the decision to enable `Config.AllowDowngrade` for explicit `CheckVersion` requests to the CLI.
 
 ## How updates work
 
 `Check` selects the exact platform archive and returns an opaque plan. The plan pins the release version, asset URL and digest, platform, executable path, and executable fingerprint. A plan belongs to the updater that created it.
 
 `Apply` takes a cross-process lock and checks the path and fingerprint again. It downloads the pinned archive, verifies its SHA-256 digest, extracts the command executable, stages it beside the target, and checks the fingerprint once more before replacement. It rejects plans made for a locally changed executable and versions that are not strictly newer. A plan remains a snapshot of the release and attestation accepted by `Check`; `Apply` does not query GitHub again.
+
+### Installing a specific version
+
+`CheckVersion(ctx, "v1.2.3")` creates a plan for that exact stable release tag. Newer targeted releases install normally; reinstalling the current version or downgrading also requires `Config.AllowDowngrade: true`. This opt-in never changes plans returned by `Check`: the automatic latest-release path remains strictly newer because replayed old releases still carry valid attestations.
 
 Unix replaces the target with one rename, then syncs the file and parent directory. Windows renames the old executable aside, installs the staged file, and restores the backup if installation fails. A running process may keep the old Windows executable open; in that case `CleanupPending` is true and a later update retries removal.
 
