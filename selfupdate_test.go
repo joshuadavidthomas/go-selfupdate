@@ -565,6 +565,165 @@ func TestApplyDetectsExecutableChangeDuringDownload(t *testing.T) {
 	}
 }
 
+// newDownloadTimingTestUpdater builds a fixture whose /asset handler is fully
+// caller-controlled, so tests can delay, stall, or block the archive transfer
+// to exercise download timing behavior.
+func newDownloadTimingTestUpdater(t *testing.T, archive []byte, assetHandler http.HandlerFunc) (*Updater, *httptest.Server, string) {
+	t.Helper()
+	archiveHash := sha256.Sum256(archive)
+	digest := fmt.Sprintf("sha256:%x", archiveHash)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo/releases/latest":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v2.0.0", "name": "Release v2.0.0", "body": "notes",
+				"html_url": server.URL + "/release", "published_at": "2026-01-02T03:04:05Z",
+				"assets": []map[string]any{{
+					"name": "tool_linux_amd64.tar.gz", "browser_download_url": server.URL + "/asset",
+					"size": len(archive), "digest": digest,
+				}},
+			})
+		case "/asset":
+			assetHandler(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	target := filepath.Join(t.TempDir(), "tool")
+	if err := os.WriteFile(target, []byte("old"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	u := mustUpdater(t, "v1.0.0")
+	u.apiBaseURL = server.URL
+	u.allowHTTP = true
+	u.goos, u.goarch = "linux", "amd64"
+	u.executablePath = func() (string, error) { return target, nil }
+	return u, server, target
+}
+
+func TestApplyDownloadsSlowerThanClientTimeout(t *testing.T) {
+	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
+	u, _, target := newDownloadTimingTestUpdater(t, archive, func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Errorf("ResponseWriter does not support Flush")
+			return
+		}
+		half := len(archive) / 2
+		if _, err := w.Write(archive[:half]); err != nil {
+			return
+		}
+		flusher.Flush()
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write(archive[half:])
+	})
+	u.httpClient.Timeout = 200 * time.Millisecond
+
+	plan, err := u.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if _, err := u.Apply(context.Background(), plan); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "new" {
+		t.Fatalf("installed %q", body)
+	}
+}
+
+func TestApplyDownloadStallAborts(t *testing.T) {
+	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
+	block := make(chan struct{})
+	u, _, target := newDownloadTimingTestUpdater(t, archive, func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Errorf("ResponseWriter does not support Flush")
+			return
+		}
+		half := len(archive) / 2
+		if _, err := w.Write(archive[:half]); err != nil {
+			return
+		}
+		flusher.Flush()
+		<-block
+	})
+	// Registered after newDownloadTimingTestUpdater's t.Cleanup(server.Close), so
+	// LIFO cleanup order closes block (unblocking the handler) before closing the
+	// server; otherwise Close blocks up to 5s waiting for the active connection.
+	t.Cleanup(func() { close(block) })
+	u.downloadIdleTimeout = 100 * time.Millisecond
+
+	plan, err := u.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := u.Apply(context.Background(), plan)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !(errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context")) {
+			t.Fatalf("Apply error = %v, want context.Canceled or a \"context\" error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Apply did not stop after the idle timeout")
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "old" {
+		t.Fatalf("target changed to %q", body)
+	}
+}
+
+func TestApplyDownloadHonorsCallerCancellation(t *testing.T) {
+	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
+	started := make(chan struct{})
+	block := make(chan struct{})
+	u, _, _ := newDownloadTimingTestUpdater(t, archive, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(started)
+		<-block
+	})
+	// Registered after newDownloadTimingTestUpdater's t.Cleanup(server.Close), so
+	// LIFO cleanup order closes block (unblocking the handler) before closing the
+	// server; otherwise Close blocks up to 5s waiting for the active connection.
+	t.Cleanup(func() { close(block) })
+
+	plan, err := u.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := u.Apply(ctx, plan)
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Apply error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Apply did not stop after caller cancellation")
+	}
+}
+
 func TestConcurrentApplyUsesFileLock(t *testing.T) {
 	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
 	var active atomic.Int32

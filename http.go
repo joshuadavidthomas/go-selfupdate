@@ -69,7 +69,7 @@ func (u *Updater) fetchLatestRelease(ctx context.Context, expectedAsset string) 
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return errors.New("selfupdate: GitHub API redirect rejected")
 	}
-	body, err := u.doWithClient(&client, request, maxMetadataBytes, "release metadata")
+	body, err := u.doWithClient(&client, request, maxMetadataBytes, "release metadata", nil)
 	if err != nil {
 		return Release{}, releaseAsset{}, err
 	}
@@ -169,27 +169,51 @@ func (u *Updater) assetRedirectAllowed(target *url.URL) error {
 	return nil
 }
 
+// idleTimeoutReader cancels its request context when a single Read makes no
+// progress for longer than idle. It bounds stalls without capping the total
+// transfer time of large downloads.
+type idleTimeoutReader struct {
+	reader io.Reader
+	timer  *time.Timer // AfterFunc(idle, cancel), reset on every Read
+	idle   time.Duration
+}
+
+func (r *idleTimeoutReader) Read(buffer []byte) (int, error) {
+	r.timer.Reset(r.idle)
+	n, err := r.reader.Read(buffer)
+	r.timer.Reset(r.idle)
+	return n, err
+}
+
 func (u *Updater) download(ctx context.Context, rawURL string, limit int64, description string) ([]byte, error) {
 	if err := u.validateURL(rawURL, false); err != nil {
 		return nil, fmt.Errorf("selfupdate: invalid %s URL: %w", description, err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	downloadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	request, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("selfupdate: create %s request: %w", description, err)
 	}
 	request.Header.Set("Accept", "application/octet-stream")
 	request.Header.Set("User-Agent", "go-selfupdate")
 	client := *u.httpClient
+	client.Timeout = 0
 	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("selfupdate: too many release asset redirects")
 		}
 		return u.assetRedirectAllowed(request.URL)
 	}
-	return u.doWithClient(&client, request, limit, description)
+	timer := time.AfterFunc(u.downloadIdleTimeout, cancel)
+	defer timer.Stop()
+	wrap := func(reader io.Reader) io.Reader {
+		return &idleTimeoutReader{reader: reader, timer: timer, idle: u.downloadIdleTimeout}
+	}
+	return u.doWithClient(&client, request, limit, description, wrap)
 }
 
-func (u *Updater) doWithClient(client *http.Client, request *http.Request, limit int64, description string) ([]byte, error) {
+func (u *Updater) doWithClient(client *http.Client, request *http.Request, limit int64, description string, wrap func(io.Reader) io.Reader) ([]byte, error) {
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("selfupdate: fetch %s: %w", description, err)
@@ -212,7 +236,11 @@ func (u *Updater) doWithClient(client *http.Client, request *http.Request, limit
 	if response.ContentLength > limit {
 		return nil, fmt.Errorf("selfupdate: %s Content-Length %d exceeds the %d-byte limit", description, response.ContentLength, limit)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	var bodyReader io.Reader = response.Body
+	if wrap != nil {
+		bodyReader = wrap(bodyReader)
+	}
+	body, err := io.ReadAll(io.LimitReader(bodyReader, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("selfupdate: read %s: %w", description, err)
 	}
