@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -347,6 +348,38 @@ func TestApplyRejectsAssetDigestMismatch(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsAssetRedirectOffAllowlist(t *testing.T) {
+	u, server, target := newTestUpdater(t, releaseFixture{}, "v1.0.0")
+	defer server.Close()
+
+	plan, err := u.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+
+	redirectingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/asset" {
+			http.Redirect(w, r, "ftp://example.invalid/x", http.StatusFound)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer redirectingServer.Close()
+
+	plan.assetURL = redirectingServer.URL + "/asset"
+
+	if _, err := u.Apply(context.Background(), plan); err == nil || !strings.Contains(err.Error(), "release asset") || !strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("Apply error = %v, want an error containing \"release asset\" and \"rejected\"", err)
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "old" {
+		t.Fatalf("target changed to %q", body)
+	}
+}
+
 func TestPlanBoundToUpdater(t *testing.T) {
 	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
 	fixture := releaseFixture{tag: "v2.0.0", assetName: "tool_linux_amd64.tar.gz", archive: archive}
@@ -638,6 +671,54 @@ func TestValidateURLProductionAllowlist(t *testing.T) {
 		allowed := &Updater{allowHTTP: true}
 		if err := allowed.validateURL("http://127.0.0.1:8080/x", true); err != nil {
 			t.Fatalf("validateURL with allowHTTP = %v, want nil", err)
+		}
+	})
+}
+
+func TestAssetRedirectAllowed(t *testing.T) {
+	t.Parallel()
+	u := &Updater{}
+	for _, test := range []struct {
+		name    string
+		target  string
+		wantErr string
+	}{
+		{"objects host ok", "https://objects.githubusercontent.com/x", ""},
+		{"release-assets host ok", "https://release-assets.githubusercontent.com/x", ""},
+		{"github.com asset ok", "https://github.com/o/r/releases/download/v1/x", ""},
+		{"bare githubusercontent host ok", "https://githubusercontent.com/x", ""},
+		{"unrelated host rejected", "https://evil.example/x", "untrusted host"},
+		{"suffix without dot rejected", "https://evilgithubusercontent.com/x", "untrusted host"},
+		{"http downgrade rejected", "http://objects.githubusercontent.com/x", "rejected"},
+		{"non-default port rejected", "https://objects.githubusercontent.com:8443/x", "rejected"},
+		{"credentials rejected", "https://user@objects.githubusercontent.com/x", "rejected"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			target, err := url.Parse(test.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotErr := u.assetRedirectAllowed(target)
+			if test.wantErr == "" {
+				if gotErr != nil {
+					t.Fatalf("assetRedirectAllowed(%q) = %v, want nil", test.target, gotErr)
+				}
+				return
+			}
+			if gotErr == nil || !strings.Contains(gotErr.Error(), test.wantErr) {
+				t.Fatalf("assetRedirectAllowed(%q) = %v, want error containing %q", test.target, gotErr, test.wantErr)
+			}
+		})
+	}
+
+	t.Run("allowHTTP escape hatch", func(t *testing.T) {
+		allowed := &Updater{allowHTTP: true}
+		target, err := url.Parse("http://127.0.0.1:9999/x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := allowed.assetRedirectAllowed(target); err != nil {
+			t.Fatalf("assetRedirectAllowed with allowHTTP = %v, want nil", err)
 		}
 	})
 }
