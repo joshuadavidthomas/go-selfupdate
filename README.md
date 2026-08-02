@@ -96,20 +96,26 @@ checksum:
 
 ## Require GitHub artifact attestations
 
-Attestation verification is opt in. Name the one workflow allowed to sign releases:
+Attestation verification is opt in and lives in a separate subpackage. Name the one workflow allowed to sign releases and supply the standard Sigstore verifier:
 
 ```go
+import (
+    selfupdate "github.com/joshuadavidthomas/go-selfupdate"
+    "github.com/joshuadavidthomas/go-selfupdate/sigstore"
+)
+
 updater, err := selfupdate.New(selfupdate.Config{
     Repository:     "owner/project",
     Command:        "project",
     CurrentVersion: version,
     Attestation: &selfupdate.AttestationPolicy{
         SignerWorkflow: ".github/workflows/release.yml",
+        Verifier:       sigstore.New(),
     },
 })
 ```
 
-Omitting `Attestation` keeps the mandatory GitHub asset-digest check and makes no attestation request. Supplying it makes provenance mandatory: `Check` fails closed when it cannot fetch, parse, or verify a matching attestation. It never falls back to digest-only verification.
+Omitting `Attestation` keeps the mandatory GitHub asset-digest check, makes no attestation request, and means the Sigstore libraries are not linked into the binary at all: `go-selfupdate`'s root package never imports `sigstore-go`. Supplying `Attestation` makes provenance mandatory: `Check` fails closed when it cannot fetch, parse, or verify a matching attestation. It never falls back to digest-only verification. `New` fails if `Attestation` is set without a `Verifier`.
 
 A release workflow can attest the files listed by GoReleaser's checksum file:
 
