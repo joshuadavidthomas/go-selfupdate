@@ -359,6 +359,39 @@ func TestAttestationRedirectsAndBundleErrorsAreSafe(t *testing.T) {
 			t.Fatalf("fetchAttestationBundle error = %v", err)
 		}
 	})
+
+	t.Run("bundle redirect", func(t *testing.T) {
+		var redirectTargetRequests atomic.Int32
+		secondServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			redirectTargetRequests.Add(1)
+		}))
+		defer secondServer.Close()
+
+		firstServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/blob" {
+				http.Redirect(w, r, secondServer.URL, http.StatusFound)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer firstServer.Close()
+
+		u := mustUpdater(t, "v1.0.0")
+		u.allowHTTP = true
+		firstURL, err := url.Parse(firstServer.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.attestationBundleHost = firstURL.Hostname()
+
+		_, err = u.fetchAttestationBundle(context.Background(), firstServer.URL+"/blob?sig=signed-secret")
+		if err == nil || !strings.Contains(err.Error(), "request failed") || strings.Contains(err.Error(), "signed-secret") {
+			t.Fatalf("fetchAttestationBundle error = %v", err)
+		}
+		if redirectTargetRequests.Load() != 0 {
+			t.Fatalf("redirect target requests = %d", redirectTargetRequests.Load())
+		}
+	})
 }
 
 func TestAttestationBundleURLSafetyAndSnappyBounds(t *testing.T) {

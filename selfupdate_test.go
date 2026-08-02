@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -598,6 +599,112 @@ func TestConcurrentApplyUsesFileLock(t *testing.T) {
 	}
 }
 
+func TestValidateURLProductionAllowlist(t *testing.T) {
+	t.Parallel()
+	u := &Updater{}
+	for _, test := range []struct {
+		name    string
+		rawURL  string
+		api     bool
+		wantErr string
+	}{
+		{"api ok", "https://api.github.com/repos/o/r/releases/latest", true, ""},
+		{"release ok", "https://github.com/o/r/releases/download/v1/x.tar.gz", false, ""},
+		{"api host case insensitive", "https://API.GITHUB.COM/x", true, ""},
+		{"api on release host", "https://github.com/x", true, "api.github.com"},
+		{"release on api host", "https://api.github.com/x", false, "github.com"},
+		{"release on unrelated host", "https://evil.example/x", false, "github.com"},
+		{"api on suffix-matching host", "https://api.github.com.evil.example/x", true, "api.github.com"},
+		{"plain http rejected", "http://github.com/x", false, "HTTPS"},
+		{"pinned host with port ok", "https://github.com:443/x", false, ""},
+		{"credentials rejected", "https://user@github.com/x", false, "credentials"},
+		{"fragment rejected", "https://github.com/x#frag", false, "fragment"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := u.validateURL(test.rawURL, test.api)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateURL(%q, %v) = %v, want nil", test.rawURL, test.api, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("validateURL(%q, %v) = %v, want error containing %q", test.rawURL, test.api, err, test.wantErr)
+			}
+		})
+	}
+
+	t.Run("allowHTTP escape hatch", func(t *testing.T) {
+		allowed := &Updater{allowHTTP: true}
+		if err := allowed.validateURL("http://127.0.0.1:8080/x", true); err != nil {
+			t.Fatalf("validateURL with allowHTTP = %v, want nil", err)
+		}
+	})
+}
+
+func TestNewCopiesHTTPClient(t *testing.T) {
+	t.Parallel()
+	original := &http.Client{Timeout: 5 * time.Second}
+	u, err := New(Config{Repository: "owner/repo", Command: "tool", CurrentVersion: "v1.0.0", HTTPClient: original})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.httpClient == original {
+		t.Fatal("New must copy the caller-supplied HTTP client, not reuse the pointer")
+	}
+	if u.httpClient.Timeout != 5*time.Second {
+		t.Fatalf("u.httpClient.Timeout = %v, want 5s", u.httpClient.Timeout)
+	}
+	original.Timeout = 10 * time.Second
+	if u.httpClient.Timeout != 5*time.Second {
+		t.Fatalf("u.httpClient.Timeout changed after mutating caller's client: %v", u.httpClient.Timeout)
+	}
+
+	defaultClient := mustUpdater(t, "v1.0.0")
+	if defaultClient.httpClient.Timeout != 60*time.Second {
+		t.Fatalf("default u.httpClient.Timeout = %v, want 60s", defaultClient.httpClient.Timeout)
+	}
+}
+
+func TestExtractTarGzRejectsOversizedExpansion(t *testing.T) {
+	t.Parallel()
+	// extractTarGzContext bounds the decompressed stream with a LimitedReader
+	// of N = maxExpanded+1. Depending on where the budget runs out, the
+	// rejection surfaces one of two ways:
+	//   - mid-entry: a member larger than the budget makes tar.Reader's
+	//     internal skip-to-next-header logic drain the LimitedReader before
+	//     it finds the next header, surfacing io.ErrUnexpectedEOF.
+	//   - block boundary: a member that consumes exactly N bytes (512-byte
+	//     header + padded data) leaves the LimitedReader at N==0 right as the
+	//     next Next() call cleanly hits EOF, so the loop breaks normally and
+	//     the explicit post-loop "expanded archive exceeds" backstop fires.
+	t.Run("mid-entry exhaustion", func(t *testing.T) {
+		t.Parallel()
+		limit := int64(4096)
+		body := makeTar(t, []archiveMember{{name: "filler", body: make([]byte, limit+1024)}})
+		got, err := extractTarGzContext(context.Background(), body, "tool", limit)
+		if got != nil {
+			t.Fatalf("extractTarGzContext returned data %q, want nil", got)
+		}
+		if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("extractTarGzContext error = %v, want io.ErrUnexpectedEOF", err)
+		}
+	})
+
+	t.Run("block-boundary backstop", func(t *testing.T) {
+		t.Parallel()
+		limit := int64(1535) // 512-byte header + 1024-byte data = 1536 = limit+1
+		body := makeTar(t, []archiveMember{{name: "filler", body: make([]byte, 1024)}})
+		got, err := extractTarGzContext(context.Background(), body, "tool", limit)
+		if got != nil {
+			t.Fatalf("extractTarGzContext returned data %q, want nil", got)
+		}
+		if err == nil || !strings.Contains(err.Error(), "expanded archive exceeds") {
+			t.Fatalf("extractTarGzContext error = %v, want \"expanded archive exceeds\"", err)
+		}
+	})
+}
+
 func TestExtractTarGzStrictMember(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -613,7 +720,7 @@ func TestExtractTarGzStrictMember(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			body := makeTar(t, test.members)
-			got, err := extractTarGz(body, "tool")
+			got, err := extractArchive(context.Background(), "tool_linux_amd64.tar.gz", body, "tool")
 			if test.ok && (err != nil || string(got) != test.want) {
 				t.Fatalf("extract = %q, %v", got, err)
 			}
@@ -639,7 +746,7 @@ func TestExtractZIPStrictMember(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			body := makeZIP(t, test.members)
-			got, err := extractZIP(body, "tool.exe")
+			got, err := extractArchive(context.Background(), "tool_windows_amd64.zip", body, "tool.exe")
 			if test.ok && (err != nil || string(got) != test.want) {
 				t.Fatalf("extract = %q, %v", got, err)
 			}
@@ -648,6 +755,14 @@ func TestExtractZIPStrictMember(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("unsupported archive name", func(t *testing.T) {
+		body := makeZIP(t, []zipMember{{name: "tool.exe", body: []byte("command")}})
+		_, err := extractArchive(context.Background(), "tool_windows_amd64.rar", body, "tool.exe")
+		if err == nil || !strings.Contains(err.Error(), "unsupported archive name") {
+			t.Fatalf("extractArchive error = %v, want \"unsupported archive name\"", err)
+		}
+	})
 }
 
 type archiveMember struct {
