@@ -234,6 +234,10 @@ func TestApplyVerifiesAndReplacesOnlyCommand(t *testing.T) {
 	fixture := releaseFixture{tag: "v2.0.0", assetName: "tool_linux_amd64.tar.gz", archive: archive}
 	u, server, target := newTestUpdater(t, fixture, "v1.0.0")
 	defer server.Close()
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(target, 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +256,7 @@ func TestApplyVerifiesAndReplacesOnlyCommand(t *testing.T) {
 	if string(body) != "new-command" {
 		t.Fatalf("installed %q", body)
 	}
-	if !result.Committed || result.PreviousVersion != "v1.0.0" || result.Version != "v2.0.0" || result.Executable != target {
+	if !result.Committed || result.PreviousVersion != "v1.0.0" || result.Version != "v2.0.0" || result.Executable != resolvedTarget {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 	if runtime.GOOS != "windows" {
@@ -445,6 +449,10 @@ func TestApplyReturnsResultAfterPostCommitError(t *testing.T) {
 	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
 	u, server, target := newTestUpdater(t, releaseFixture{tag: "v2.0.0", assetName: "tool_linux_amd64.tar.gz", archive: archive}, "v1.0.0")
 	defer server.Close()
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
 	plan, err := u.Check(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -460,7 +468,7 @@ func TestApplyReturnsResultAfterPostCommitError(t *testing.T) {
 	if !errors.Is(err, postCommitErr) {
 		t.Fatalf("Apply error = %v", err)
 	}
-	if !result.Committed || result.Executable != target || result.Version != "v2.0.0" {
+	if !result.Committed || result.Executable != resolvedTarget || result.Version != "v2.0.0" {
 		t.Fatalf("result = %#v", result)
 	}
 	body, _ := os.ReadFile(target)
