@@ -551,11 +551,11 @@ func TestBuildCertificateIdentity(t *testing.T) {
 		if identity.Issuer.Issuer != policy.issuer {
 			t.Errorf("issuer = %q, want %q", identity.Issuer.Issuer, policy.issuer)
 		}
-		if identity.Extensions.SourceRepositoryURI != policy.sourceRepository {
-			t.Errorf("source repository = %q, want %q", identity.Extensions.SourceRepositoryURI, policy.sourceRepository)
+		if identity.SourceRepositoryURI != policy.sourceRepository {
+			t.Errorf("source repository = %q, want %q", identity.SourceRepositoryURI, policy.sourceRepository)
 		}
-		if identity.Extensions.SourceRepositoryOwnerURI != policy.sourceOwner {
-			t.Errorf("source owner = %q, want %q", identity.Extensions.SourceRepositoryOwnerURI, policy.sourceOwner)
+		if identity.SourceRepositoryOwnerURI != policy.sourceOwner {
+			t.Errorf("source owner = %q, want %q", identity.SourceRepositoryOwnerURI, policy.sourceOwner)
 		}
 	})
 
