@@ -20,15 +20,18 @@ and this project attempts to adhere to [Semantic Versioning](https://semver.org/
 
 ## [Unreleased]
 
+## [0.1.0]
+
 ### Added
 
-- Added update discovery for exact stable GitHub Releases with platform-specific archives for Linux, macOS, and Windows on AMD64 and ARM64.
-- Added immutable update plans that pin release metadata, asset identity, executable identity, and provenance before installation.
-- Added cross-process installation locking and platform-specific executable replacement with committed-state reporting.
-- Added optional GitHub artifact attestation verification bound to the source repository, release tag, workflow, asset name, and digest.
-- Added streamed downloads with bounded archive extraction and download progress callbacks.
-- Added mandatory GitHub-provided SHA-256 verification for release assets and validation for malformed, oversized, duplicated, or redirected untrusted inputs.
-- Added executable identity revalidation immediately before replacement and non-executable staging until installation commits.
-- Added abandoned staging-file cleanup that preserves active concurrent installations.
+- Update discovery for exact stable GitHub Releases with platform-specific archives for Linux, macOS, and Windows on AMD64 and ARM64.
+- Immutable update plans that pin release metadata, asset identity, executable identity, and provenance before installation.
+- Cross-process installation locking and platform-specific executable replacement with committed-state reporting.
+- Optional GitHub artifact attestation verification bound to the source repository, release tag, workflow, asset name, and digest.
+- Streamed downloads with bounded archive extraction and download progress callbacks.
+- Mandatory GitHub-provided SHA-256 verification for release assets and validation for malformed, oversized, duplicated, or redirected untrusted inputs.
+- Executable identity revalidation immediately before replacement and non-executable staging until installation commits.
+- Abandoned staging-file cleanup that preserves active concurrent installations.
 
-[unreleased]: https://github.com/joshuadavidthomas/go-selfupdate/commits/main
+[unreleased]: https://github.com/joshuadavidthomas/go-selfupdate/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/joshuadavidthomas/go-selfupdate/releases/tag/v0.1.0
