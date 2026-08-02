@@ -214,6 +214,9 @@ func TestCheckAttestationRequestAndVerifiedPlan(t *testing.T) {
 	if gotPolicy.identity != wantIdentity || gotPolicy.issuer != attestationIssuer || gotPolicy.predicate != attestationPredicate || gotPolicy.assetName != "tool_linux_amd64.tar.gz" || gotPolicy.digest != fixture.archiveDigest {
 		t.Fatalf("verification policy = %#v", gotPolicy)
 	}
+	if gotPolicy.sourceRepository != "https://github.com/owner/repo" || gotPolicy.sourceOwner != "https://github.com/owner" {
+		t.Fatalf("verification policy source repository/owner = %q, %q", gotPolicy.sourceRepository, gotPolicy.sourceOwner)
+	}
 }
 
 func TestCheckAttestationFailuresPrecedeArchiveDownload(t *testing.T) {
@@ -526,6 +529,53 @@ func TestApplyRequiresMatchingProvenanceBeforeDownload(t *testing.T) {
 	if fixture.archiveRequests.Load() != 0 {
 		t.Fatalf("archive requests = %d", fixture.archiveRequests.Load())
 	}
+}
+
+func TestBuildCertificateIdentity(t *testing.T) {
+	t.Parallel()
+	t.Run("happy path", func(t *testing.T) {
+		t.Parallel()
+		policy := attestationVerificationPolicy{
+			identity:         "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v1.0.0",
+			issuer:           attestationIssuer,
+			sourceRepository: "https://github.com/owner/repo",
+			sourceOwner:      "https://github.com/owner",
+		}
+		identity, err := buildCertificateIdentity(policy)
+		if err != nil {
+			t.Fatalf("buildCertificateIdentity: %v", err)
+		}
+		if identity.SubjectAlternativeName.SubjectAlternativeName != policy.identity {
+			t.Errorf("SAN = %q, want %q", identity.SubjectAlternativeName.SubjectAlternativeName, policy.identity)
+		}
+		if identity.Issuer.Issuer != policy.issuer {
+			t.Errorf("issuer = %q, want %q", identity.Issuer.Issuer, policy.issuer)
+		}
+		if identity.SourceRepositoryURI != policy.sourceRepository {
+			t.Errorf("source repository = %q, want %q", identity.SourceRepositoryURI, policy.sourceRepository)
+		}
+		if identity.SourceRepositoryOwnerURI != policy.sourceOwner {
+			t.Errorf("source owner = %q, want %q", identity.SourceRepositoryOwnerURI, policy.sourceOwner)
+		}
+	})
+
+	t.Run("empty identity", func(t *testing.T) {
+		t.Parallel()
+		_, err := buildCertificateIdentity(attestationVerificationPolicy{issuer: attestationIssuer})
+		if err == nil {
+			t.Fatal("buildCertificateIdentity accepted an empty identity")
+		}
+	})
+
+	t.Run("empty issuer", func(t *testing.T) {
+		t.Parallel()
+		_, err := buildCertificateIdentity(attestationVerificationPolicy{
+			identity: "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v1.0.0",
+		})
+		if err == nil {
+			t.Fatal("buildCertificateIdentity accepted an empty issuer")
+		}
+	})
 }
 
 func TestSigstoreTrustedRootInitializationRetriesAfterFailure(t *testing.T) {

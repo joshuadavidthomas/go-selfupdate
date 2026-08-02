@@ -18,6 +18,7 @@ import (
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/sigstore/sigstore-go/pkg/bundle"
+	"github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
@@ -39,11 +40,13 @@ const (
 )
 
 type attestationVerificationPolicy struct {
-	identity  string
-	issuer    string
-	predicate string
-	assetName string
-	digest    [sha256.Size]byte
+	identity         string
+	issuer           string
+	predicate        string
+	assetName        string
+	digest           [sha256.Size]byte
+	sourceRepository string // https://github.com/<owner>/<repo>
+	sourceOwner      string // https://github.com/<owner>
 }
 
 type provenanceRecord struct {
@@ -77,11 +80,13 @@ type githubAttestationsResponse struct {
 
 func (u *Updater) verifyAttestation(ctx context.Context, release Release, asset releaseAsset) (*provenanceRecord, error) {
 	policy := attestationVerificationPolicy{
-		identity:  "https://github.com/" + u.owner + "/" + u.repository + "/" + u.attestationWorkflow + "@refs/tags/" + release.Version,
-		issuer:    attestationIssuer,
-		predicate: attestationPredicate,
-		assetName: asset.name,
-		digest:    asset.digest,
+		identity:         "https://github.com/" + u.owner + "/" + u.repository + "/" + u.attestationWorkflow + "@refs/tags/" + release.Version,
+		issuer:           attestationIssuer,
+		predicate:        attestationPredicate,
+		assetName:        asset.name,
+		digest:           asset.digest,
+		sourceRepository: "https://github.com/" + u.owner + "/" + u.repository,
+		sourceOwner:      "https://github.com/" + u.owner,
 	}
 
 	pageURL, err := u.attestationAPIURL(asset.digest)
@@ -330,6 +335,21 @@ func (u *Updater) fetchAttestationBundle(ctx context.Context, rawURL string) ([]
 	return decoded, nil
 }
 
+func buildCertificateIdentity(policy attestationVerificationPolicy) (verify.CertificateIdentity, error) {
+	sanMatcher, err := verify.NewSANMatcher(policy.identity, "")
+	if err != nil {
+		return verify.CertificateIdentity{}, err
+	}
+	issuerMatcher, err := verify.NewIssuerMatcher(policy.issuer, "")
+	if err != nil {
+		return verify.CertificateIdentity{}, err
+	}
+	return verify.NewCertificateIdentity(sanMatcher, issuerMatcher, certificate.Extensions{
+		SourceRepositoryURI:      policy.sourceRepository,
+		SourceRepositoryOwnerURI: policy.sourceOwner,
+	})
+}
+
 func (v *sigstoreAttestationVerifier) Verify(ctx context.Context, bundleJSON []byte, policy attestationVerificationPolicy) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -338,7 +358,7 @@ func (v *sigstoreAttestationVerifier) Verify(ctx context.Context, bundleJSON []b
 	if err := signedBundle.UnmarshalJSON(bundleJSON); err != nil {
 		return fmt.Errorf("parse Sigstore bundle: %w", err)
 	}
-	identity, err := verify.NewShortCertificateIdentity(policy.issuer, "", policy.identity, "")
+	identity, err := buildCertificateIdentity(policy)
 	if err != nil {
 		return fmt.Errorf("build attestation identity policy: %w", err)
 	}
