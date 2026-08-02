@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -340,6 +341,9 @@ func (u *Updater) Apply(ctx context.Context, plan *Plan) (result Result, returnE
 	if err := cleanupStaleStages(target); err != nil {
 		return Result{}, fmt.Errorf("selfupdate: clean stale staged executables: %w", err)
 	}
+	if err := cleanupStaleArchives(target); err != nil {
+		return Result{}, fmt.Errorf("selfupdate: clean stale downloaded archives: %w", err)
+	}
 	currentHash, mode, err := hashExecutable(ctx, target)
 	if err != nil {
 		return Result{}, err
@@ -347,23 +351,47 @@ func (u *Updater) Apply(ctx context.Context, plan *Plan) (result Result, returnE
 	if currentHash != plan.executableHash {
 		return Result{}, errors.New("selfupdate: executable changed since Check")
 	}
-	archiveBody, err := u.download(ctx, plan.assetURL, maxArchiveBytes, "release asset", plan.assetSize)
+	archiveFile, err := createArchiveFile(target)
+	if err != nil {
+		return Result{}, fmt.Errorf("selfupdate: create archive file: %w", err)
+	}
+	archiveExists := true
+	defer func() {
+		if err := archiveFile.Close(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("selfupdate: close downloaded archive: %w", err))
+		}
+		if archiveExists {
+			if err := os.Remove(archiveFile.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+				returnErr = errors.Join(returnErr, fmt.Errorf("selfupdate: remove downloaded archive: %w", err))
+			}
+		}
+	}()
+
+	archiveDigest, err := u.downloadToFile(ctx, plan.assetURL, maxArchiveBytes, "release asset", plan.assetSize, archiveFile)
 	if err != nil {
 		return Result{}, err
 	}
-	archiveDigest := sha256.Sum256(archiveBody)
+	// The digest is verified over the complete downloaded archive before any
+	// extraction begins: nothing below this point reads archiveFile's
+	// contents until the comparison succeeds.
 	if archiveDigest != plan.archiveDigest {
 		return Result{}, fmt.Errorf("selfupdate: SHA-256 mismatch for %s", plan.assetName)
+	}
+	if err := archiveFile.Sync(); err != nil {
+		return Result{}, fmt.Errorf("selfupdate: sync downloaded archive: %w", err)
+	}
+	archiveInfo, err := archiveFile.Stat()
+	if err != nil {
+		return Result{}, fmt.Errorf("selfupdate: stat downloaded archive: %w", err)
+	}
+	if _, err := archiveFile.Seek(0, io.SeekStart); err != nil {
+		return Result{}, fmt.Errorf("selfupdate: seek downloaded archive: %w", err)
 	}
 	_, memberName, err := expectedNames(u.command, plan.goos, plan.goarch)
 	if err != nil {
 		return Result{}, err
 	}
-	binary, err := extractArchive(ctx, plan.assetName, archiveBody, memberName)
-	if err != nil {
-		return Result{}, fmt.Errorf("selfupdate: extract %s: %w", plan.assetName, err)
-	}
-	stage, err := stageExecutable(ctx, target, binary, mode)
+	stage, err := stageExecutable(ctx, target, mode, plan.assetName, archiveFile, archiveInfo.Size(), memberName)
 	if err != nil {
 		return Result{}, fmt.Errorf("selfupdate: stage executable: %w", err)
 	}

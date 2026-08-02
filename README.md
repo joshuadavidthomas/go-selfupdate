@@ -160,7 +160,7 @@ Cancellation stops ordinary work until replacement begins. The bounded Sigstore 
 
 The GitHub asset digest detects corruption and downloads that differ from the asset selected by `Check`. By itself it is not an independent publisher signature, so digest-only mode trusts GitHub, the repository, and anyone allowed to publish its releases. The optional attestation policy narrows publisher authority to one GitHub Actions workflow as described above.
 
-The package bounds network and archive reads, accepts one exact regular archive member, resolves executable symlinks, locks across processes, uses random same-directory staging names, and checks for executable changes before installation. Asset downloads follow redirects only to `github.com` and `*.githubusercontent.com` over HTTPS.
+The package streams asset downloads to a random same-directory temporary file and extracts directly into the staged executable, so neither the archive nor the extracted binary is ever buffered in memory; the SHA-256 digest is verified over the complete downloaded archive before any extraction begins. It bounds network and archive reads (ZIP archives are additionally capped at 4096 entries), accepts one exact regular archive member, resolves executable symlinks, locks across processes, uses random same-directory staging names, and checks for executable changes before installation. Asset downloads follow redirects only to `github.com` and `*.githubusercontent.com` over HTTPS.
 
 On Windows, a process crash between renaming the old executable and installing the new one can leave only the hidden backup. Windows has no portable in-process operation that closes this gap while the executable is running.
 

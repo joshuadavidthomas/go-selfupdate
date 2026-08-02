@@ -291,7 +291,9 @@ func TestStageExecutableModeAppliedAfterWrite(t *testing.T) {
 	if err := os.WriteFile(target, []byte("old"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path, err := stageExecutable(context.Background(), target, []byte("new-binary"), 0o755)
+	body := makeTar(t, []archiveMember{{name: "tool", body: []byte("new-binary")}})
+	archive, size := archiveFile(t, body)
+	path, err := stageExecutable(context.Background(), target, 0o755, "tool_linux_amd64.tar.gz", archive, size, "tool")
 	if err != nil {
 		t.Fatalf("stageExecutable: %v", err)
 	}
@@ -305,6 +307,13 @@ func TestStageExecutableModeAppliedAfterWrite(t *testing.T) {
 		if info.Mode().Perm() != 0o755 {
 			t.Fatalf("mode = %o, want 0755", info.Mode().Perm())
 		}
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new-binary" {
+		t.Fatalf("staged content = %q, want %q", got, "new-binary")
 	}
 
 	pattern := regexp.MustCompile(`^\.` + regexp.QuoteMeta(filepath.Base(target)) + `\.selfupdate-stage-[0-9a-f]{32}$`)
@@ -320,14 +329,19 @@ func TestApplySweepsStaleStagedExecutables(t *testing.T) {
 	defer server.Close()
 	directory := filepath.Dir(target)
 
-	matching := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("a", 32))
-	tooShort := filepath.Join(directory, ".tool.selfupdate-stage-abc")
 	// Uppercase hex fails the lower-hex matcher; use "F" rather than "A" so the
 	// name still differs from the matching fixture on case-insensitive
 	// filesystems (macOS, Windows), where "a"*32 and "A"*32 would collide.
-	wrongCase := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("F", 32))
+	matchingStage := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("a", 32))
+	tooShortStage := filepath.Join(directory, ".tool.selfupdate-stage-abc")
+	wrongCaseStage := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("F", 32))
+	matchingArchive := filepath.Join(directory, ".tool.selfupdate-archive-"+strings.Repeat("a", 32))
+	tooShortArchive := filepath.Join(directory, ".tool.selfupdate-archive-abc")
+	wrongCaseArchive := filepath.Join(directory, ".tool.selfupdate-archive-"+strings.Repeat("F", 32))
 	unrelated := filepath.Join(directory, ".tool.other")
-	for _, path := range []string{matching, tooShort, wrongCase, unrelated} {
+	matching := []string{matchingStage, matchingArchive}
+	nearMisses := []string{tooShortStage, wrongCaseStage, tooShortArchive, wrongCaseArchive, unrelated}
+	for _, path := range append(append([]string{}, matching...), nearMisses...) {
 		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -341,10 +355,12 @@ func TestApplySweepsStaleStagedExecutables(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	if _, err := os.Stat(matching); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stale stage still exists (stat err = %v)", err)
+	for _, path := range matching {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale file %s still exists (stat err = %v)", path, err)
+		}
 	}
-	for _, path := range []string{tooShort, wrongCase, unrelated} {
+	for _, path := range nearMisses {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("near-miss %s was removed: %v", path, err)
 		}
@@ -355,27 +371,31 @@ func TestCleanupStaleStagesSkipsSymlinks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlinked stage names are a Unix-only concern")
 	}
-	directory := t.TempDir()
-	target := filepath.Join(directory, "tool")
+	for _, infix := range []string{"stage", "archive"} {
+		t.Run(infix, func(t *testing.T) {
+			directory := t.TempDir()
+			target := filepath.Join(directory, "tool")
 
-	victimDir := t.TempDir()
-	victim := filepath.Join(victimDir, "victim")
-	if err := os.WriteFile(victim, []byte("victim"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	symlinkPath := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("a", 32))
-	if err := os.Symlink(victim, symlinkPath); err != nil {
-		t.Fatal(err)
-	}
+			victimDir := t.TempDir()
+			victim := filepath.Join(victimDir, "victim")
+			if err := os.WriteFile(victim, []byte("victim"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			symlinkPath := filepath.Join(directory, ".tool.selfupdate-"+infix+"-"+strings.Repeat("a", 32))
+			if err := os.Symlink(victim, symlinkPath); err != nil {
+				t.Fatal(err)
+			}
 
-	if err := cleanupStaleStages(target); err != nil {
-		t.Fatalf("cleanupStaleStages: %v", err)
-	}
-	if _, err := os.Lstat(symlinkPath); err != nil {
-		t.Fatalf("symlink removed: %v", err)
-	}
-	if _, err := os.Stat(victim); err != nil {
-		t.Fatalf("victim removed: %v", err)
+			if err := cleanupStaleFiles(target, infix); err != nil {
+				t.Fatalf("cleanupStaleFiles: %v", err)
+			}
+			if _, err := os.Lstat(symlinkPath); err != nil {
+				t.Fatalf("symlink removed: %v", err)
+			}
+			if _, err := os.Stat(victim); err != nil {
+				t.Fatalf("victim removed: %v", err)
+			}
+		})
 	}
 }
 
@@ -452,6 +472,22 @@ func TestApplyRejectsAssetDigestMismatch(t *testing.T) {
 	}
 	if string(body) != "old" {
 		t.Fatalf("target changed to %q", body)
+	}
+
+	directory := filepath.Dir(target)
+	stageMatches, err := filepath.Glob(filepath.Join(directory, ".tool.selfupdate-stage-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stageMatches) != 0 {
+		t.Fatalf("stage file created despite digest mismatch: %v", stageMatches)
+	}
+	archiveMatches, err := filepath.Glob(filepath.Join(directory, ".tool.selfupdate-archive-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archiveMatches) != 0 {
+		t.Fatalf("downloaded archive not cleaned up after digest mismatch: %v", archiveMatches)
 	}
 }
 
@@ -882,6 +918,90 @@ func TestApplyReportsDownloadProgress(t *testing.T) {
 	}
 }
 
+func TestDownloadToFile(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		content := bytes.Repeat([]byte("x"), 1024)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(content)
+		}))
+		defer server.Close()
+
+		u := mustUpdater(t, "v1.0.0")
+		u.allowHTTP = true
+		file, err := os.CreateTemp(t.TempDir(), "archive-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = file.Close() }()
+
+		digest, err := u.downloadToFile(context.Background(), server.URL+"/asset", int64(len(content)), "release asset", 0, file)
+		if err != nil {
+			t.Fatalf("downloadToFile: %v", err)
+		}
+		want := sha256.Sum256(content)
+		if digest != want {
+			t.Fatalf("digest = %x, want %x", digest, want)
+		}
+		got, err := os.ReadFile(file.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Fatalf("file contents = %d bytes, want %d bytes matching the served archive", len(got), len(content))
+		}
+	})
+
+	t.Run("oversize rejection", func(t *testing.T) {
+		content := bytes.Repeat([]byte("x"), 1025)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Write in two flushed chunks so the server cannot compute
+			// Content-Length up front; this forces the post-copy
+			// written-bytes check (rather than the earlier Content-Length
+			// check) to be the one that rejects the oversized body.
+			flusher, _ := w.(http.Flusher)
+			_, _ = w.Write(content[:1])
+			if flusher != nil {
+				flusher.Flush()
+			}
+			_, _ = w.Write(content[1:])
+		}))
+		defer server.Close()
+
+		u := mustUpdater(t, "v1.0.0")
+		u.allowHTTP = true
+		file, err := os.CreateTemp(t.TempDir(), "archive-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = file.Close() }()
+
+		_, err = u.downloadToFile(context.Background(), server.URL+"/asset", 1024, "release asset", 0, file)
+		if err == nil || !strings.Contains(err.Error(), "exceeds the 1024-byte limit") {
+			t.Fatalf("downloadToFile error = %v, want a byte-limit error", err)
+		}
+	})
+
+	t.Run("non-2xx", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "not found here", http.StatusNotFound)
+		}))
+		defer server.Close()
+
+		u := mustUpdater(t, "v1.0.0")
+		u.allowHTTP = true
+		file, err := os.CreateTemp(t.TempDir(), "archive-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = file.Close() }()
+
+		_, err = u.downloadToFile(context.Background(), server.URL+"/asset", 1024, "release asset", 0, file)
+		if err == nil || !strings.Contains(err.Error(), "HTTP 404") || !strings.Contains(err.Error(), "not found here") {
+			t.Fatalf("downloadToFile error = %v, want an HTTP 404 error mentioning the response body", err)
+		}
+	})
+}
+
 func TestConcurrentApplyUsesFileLock(t *testing.T) {
 	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
 	var active atomic.Int32
@@ -1064,6 +1184,27 @@ func TestNewCopiesHTTPClient(t *testing.T) {
 	}
 }
 
+// archiveFile writes body to a temp file for tests exercising the streaming
+// extraction signatures, which take an *os.File (as production callers do,
+// after downloadToFile) rather than a []byte. Buffering the archive bytes in
+// a test fixture is fine; only production code must avoid buffering the full
+// archive.
+func archiveFile(t *testing.T, body []byte) (*os.File, int64) {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "archive-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	if _, err := file.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	return file, int64(len(body))
+}
+
 func TestExtractTarGzRejectsOversizedExpansion(t *testing.T) {
 	t.Parallel()
 	// extractTarGzContext bounds the decompressed stream with a LimitedReader
@@ -1080,9 +1221,11 @@ func TestExtractTarGzRejectsOversizedExpansion(t *testing.T) {
 		t.Parallel()
 		limit := int64(4096)
 		body := makeTar(t, []archiveMember{{name: "filler", body: make([]byte, limit+1024)}})
-		got, err := extractTarGzContext(context.Background(), body, "tool", limit)
-		if got != nil {
-			t.Fatalf("extractTarGzContext returned data %q, want nil", got)
+		archive, _ := archiveFile(t, body)
+		var destination bytes.Buffer
+		written, err := extractTarGzContext(context.Background(), archive, "tool", limit, &destination)
+		if written != 0 {
+			t.Fatalf("extractTarGzContext wrote %d bytes, want 0", written)
 		}
 		if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatalf("extractTarGzContext error = %v, want io.ErrUnexpectedEOF", err)
@@ -1093,9 +1236,11 @@ func TestExtractTarGzRejectsOversizedExpansion(t *testing.T) {
 		t.Parallel()
 		limit := int64(1535) // 512-byte header + 1024-byte data = 1536 = limit+1
 		body := makeTar(t, []archiveMember{{name: "filler", body: make([]byte, 1024)}})
-		got, err := extractTarGzContext(context.Background(), body, "tool", limit)
-		if got != nil {
-			t.Fatalf("extractTarGzContext returned data %q, want nil", got)
+		archive, _ := archiveFile(t, body)
+		var destination bytes.Buffer
+		written, err := extractTarGzContext(context.Background(), archive, "tool", limit, &destination)
+		if written != 0 {
+			t.Fatalf("extractTarGzContext wrote %d bytes, want 0", written)
 		}
 		if err == nil || !strings.Contains(err.Error(), "expanded archive exceeds") {
 			t.Fatalf("extractTarGzContext error = %v, want \"expanded archive exceeds\"", err)
@@ -1118,12 +1263,14 @@ func TestExtractTarGzStrictMember(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			body := makeTar(t, test.members)
-			got, err := extractArchive(context.Background(), "tool_linux_amd64.tar.gz", body, "tool")
-			if test.ok && (err != nil || string(got) != test.want) {
-				t.Fatalf("extract = %q, %v", got, err)
+			archive, size := archiveFile(t, body)
+			var destination bytes.Buffer
+			written, err := extractArchive(context.Background(), "tool_linux_amd64.tar.gz", archive, size, "tool", &destination)
+			if test.ok && (err != nil || destination.String() != test.want || written != int64(len(test.want))) {
+				t.Fatalf("extract = %q (written=%d), %v", destination.String(), written, err)
 			}
 			if !test.ok && err == nil {
-				t.Fatalf("extract accepted archive: %q", got)
+				t.Fatalf("extract accepted archive: %q", destination.String())
 			}
 		})
 	}
@@ -1144,23 +1291,51 @@ func TestExtractZIPStrictMember(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			body := makeZIP(t, test.members)
-			got, err := extractArchive(context.Background(), "tool_windows_amd64.zip", body, "tool.exe")
-			if test.ok && (err != nil || string(got) != test.want) {
-				t.Fatalf("extract = %q, %v", got, err)
+			archive, size := archiveFile(t, body)
+			var destination bytes.Buffer
+			written, err := extractArchive(context.Background(), "tool_windows_amd64.zip", archive, size, "tool.exe", &destination)
+			if test.ok && (err != nil || destination.String() != test.want || written != int64(len(test.want))) {
+				t.Fatalf("extract = %q (written=%d), %v", destination.String(), written, err)
 			}
 			if !test.ok && err == nil {
-				t.Fatalf("extract accepted archive: %q", got)
+				t.Fatalf("extract accepted archive: %q", destination.String())
 			}
 		})
 	}
 
 	t.Run("unsupported archive name", func(t *testing.T) {
 		body := makeZIP(t, []zipMember{{name: "tool.exe", body: []byte("command")}})
-		_, err := extractArchive(context.Background(), "tool_windows_amd64.rar", body, "tool.exe")
+		archive, size := archiveFile(t, body)
+		var destination bytes.Buffer
+		_, err := extractArchive(context.Background(), "tool_windows_amd64.rar", archive, size, "tool.exe", &destination)
 		if err == nil || !strings.Contains(err.Error(), "unsupported archive name") {
 			t.Fatalf("extractArchive error = %v, want \"unsupported archive name\"", err)
 		}
 	})
+}
+
+func TestExtractZIPRejectsExcessiveEntries(t *testing.T) {
+	// Built directly with zip.Store (not the shared makeZIP helper, which
+	// hardcodes zip.Deflate) so that setting up thousands of tiny entries
+	// stays fast: per-entry deflate compressor initialization dominated this
+	// fixture's construction time when measured with Deflate.
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	for i := 0; i < maxZIPEntries+1; i++ {
+		header := &zip.FileHeader{Name: fmt.Sprintf("file%d", i), Method: zip.Store}
+		if _, err := writer.CreateHeader(header); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archive, size := archiveFile(t, output.Bytes())
+	var destination bytes.Buffer
+	_, err := extractArchive(context.Background(), "tool_windows_amd64.zip", archive, size, "tool.exe", &destination)
+	if err == nil || !strings.Contains(err.Error(), "entries") {
+		t.Fatalf("extractArchive error = %v, want an error mentioning entries", err)
+	}
 }
 
 type archiveMember struct {
