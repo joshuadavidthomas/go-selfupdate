@@ -26,10 +26,6 @@ func extractArchive(ctx context.Context, assetName string, body []byte, memberNa
 	}
 }
 
-func extractTarGz(body []byte, memberName string) ([]byte, error) {
-	return extractTarGzContext(context.Background(), body, memberName)
-}
-
 func extractTarGzContext(ctx context.Context, body []byte, memberName string) ([]byte, error) {
 	compressed := &contextReader{ctx: ctx, reader: bytes.NewReader(body)}
 	gzipReader, err := gzip.NewReader(compressed)
@@ -86,10 +82,6 @@ func extractTarGzContext(ctx context.Context, body []byte, memberName string) ([
 		return nil, fmt.Errorf("archive has no exact regular root member %q", memberName)
 	}
 	return binary, nil
-}
-
-func extractZIP(body []byte, memberName string) ([]byte, error) {
-	return extractZIPContext(context.Background(), body, memberName)
 }
 
 func extractZIPContext(ctx context.Context, body []byte, memberName string) ([]byte, error) {
