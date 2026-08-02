@@ -18,7 +18,7 @@ const maxExpandedArchiveBytes int64 = 512 << 20
 func extractArchive(ctx context.Context, assetName string, body []byte, memberName string) ([]byte, error) {
 	switch {
 	case strings.HasSuffix(assetName, ".tar.gz"):
-		return extractTarGzContext(ctx, body, memberName)
+		return extractTarGzContext(ctx, body, memberName, maxExpandedArchiveBytes)
 	case strings.HasSuffix(assetName, ".zip"):
 		return extractZIPContext(ctx, body, memberName)
 	default:
@@ -26,14 +26,14 @@ func extractArchive(ctx context.Context, assetName string, body []byte, memberNa
 	}
 }
 
-func extractTarGzContext(ctx context.Context, body []byte, memberName string) ([]byte, error) {
+func extractTarGzContext(ctx context.Context, body []byte, memberName string, maxExpanded int64) ([]byte, error) {
 	compressed := &contextReader{ctx: ctx, reader: bytes.NewReader(body)}
 	gzipReader, err := gzip.NewReader(compressed)
 	if err != nil {
 		return nil, fmt.Errorf("open gzip stream: %w", err)
 	}
 	defer func() { _ = gzipReader.Close() }()
-	limited := &io.LimitedReader{R: gzipReader, N: maxExpandedArchiveBytes + 1}
+	limited := &io.LimitedReader{R: gzipReader, N: maxExpanded + 1}
 	tarReader := tar.NewReader(limited)
 	var binary []byte
 	found := false
@@ -76,7 +76,7 @@ func extractTarGzContext(ctx context.Context, body []byte, memberName string) ([
 		found = true
 	}
 	if limited.N <= 0 {
-		return nil, fmt.Errorf("expanded archive exceeds the %d-byte limit", maxExpandedArchiveBytes)
+		return nil, fmt.Errorf("expanded archive exceeds the %d-byte limit", maxExpanded)
 	}
 	if !found {
 		return nil, fmt.Errorf("archive has no exact regular root member %q", memberName)

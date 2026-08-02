@@ -667,47 +667,42 @@ func TestNewCopiesHTTPClient(t *testing.T) {
 }
 
 func TestExtractTarGzRejectsOversizedExpansion(t *testing.T) {
-	var output bytes.Buffer
-	gzipWriter, err := gzip.NewWriterLevel(&output, gzip.BestSpeed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tarWriter := tar.NewWriter(gzipWriter)
-	size := maxExpandedArchiveBytes + (1 << 20) // 1 MiB over the limit
-	if err := tarWriter.WriteHeader(&tar.Header{Name: "filler", Mode: 0o644, Size: size, Typeflag: tar.TypeReg}); err != nil {
-		t.Fatal(err)
-	}
-	chunk := make([]byte, 8<<20) // zeros compress to almost nothing
-	for written := int64(0); written < size; {
-		n := int64(len(chunk))
-		if remaining := size - written; remaining < n {
-			n = remaining
+	t.Parallel()
+	// extractTarGzContext bounds the decompressed stream with a LimitedReader
+	// of N = maxExpanded+1. Depending on where the budget runs out, the
+	// rejection surfaces one of two ways:
+	//   - mid-entry: a member larger than the budget makes tar.Reader's
+	//     internal skip-to-next-header logic drain the LimitedReader before
+	//     it finds the next header, surfacing io.ErrUnexpectedEOF.
+	//   - block boundary: a member that consumes exactly N bytes (512-byte
+	//     header + padded data) leaves the LimitedReader at N==0 right as the
+	//     next Next() call cleanly hits EOF, so the loop breaks normally and
+	//     the explicit post-loop "expanded archive exceeds" backstop fires.
+	t.Run("mid-entry exhaustion", func(t *testing.T) {
+		t.Parallel()
+		limit := int64(4096)
+		body := makeTar(t, []archiveMember{{name: "filler", body: make([]byte, limit+1024)}})
+		got, err := extractTarGzContext(context.Background(), body, "tool", limit)
+		if got != nil {
+			t.Fatalf("extractTarGzContext returned data %q, want nil", got)
 		}
-		if _, err := tarWriter.Write(chunk[:n]); err != nil {
-			t.Fatal(err)
+		if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("extractTarGzContext error = %v, want io.ErrUnexpectedEOF", err)
 		}
-		written += n
-	}
-	if err := tarWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := gzipWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := extractTarGzContext(context.Background(), output.Bytes(), "tool")
-	if got != nil {
-		t.Fatalf("extractTarGzContext returned data %q, want nil", got)
-	}
-	// For a single oversized skipped member, tar.Reader's internal skip logic
-	// consumes the LimitedReader's remaining budget and surfaces the shortfall
-	// itself as io.ErrUnexpectedEOF before the loop ever reaches the post-loop
-	// "expanded archive exceeds" check. That explicit check remains as a
-	// backstop for archive layouts that exhaust the budget exactly on a tar
-	// block boundary (e.g. multiple members), so either error shape is a
-	// correct rejection of the oversized archive.
-	if err == nil || !(errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(err.Error(), "expanded archive exceeds")) {
-		t.Fatalf("extractTarGzContext error = %v, want io.ErrUnexpectedEOF or \"expanded archive exceeds\"", err)
-	}
+	})
+
+	t.Run("block-boundary backstop", func(t *testing.T) {
+		t.Parallel()
+		limit := int64(1535) // 512-byte header + 1024-byte data = 1536 = limit+1
+		body := makeTar(t, []archiveMember{{name: "filler", body: make([]byte, 1024)}})
+		got, err := extractTarGzContext(context.Background(), body, "tool", limit)
+		if got != nil {
+			t.Fatalf("extractTarGzContext returned data %q, want nil", got)
+		}
+		if err == nil || !strings.Contains(err.Error(), "expanded archive exceeds") {
+			t.Fatalf("extractTarGzContext error = %v, want \"expanded archive exceeds\"", err)
+		}
+	})
 }
 
 func TestExtractTarGzStrictMember(t *testing.T) {
