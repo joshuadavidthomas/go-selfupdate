@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -204,19 +205,23 @@ func (r *countingReader) Read(buffer []byte) (int, error) {
 	return n, err
 }
 
-// download fetches rawURL, reporting cumulative progress against total
-// through u.downloadProgress when both are set. total is the release asset
-// size pinned by Check; callers with no known total (or no progress
-// consumer) pass 0, which disables progress reporting for that call.
-func (u *Updater) download(ctx context.Context, rawURL string, limit int64, description string, total int64) ([]byte, error) {
+// downloadToFile fetches rawURL and streams the response body into file,
+// hashing bytes as they are written so the digest is available without a
+// second pass or a buffered copy. It mirrors download/doWithClient's
+// redirect policy, Timeout=0 override, idle watchdog, non-2xx handling, and
+// >limit overflow rejection; total enables progress reporting exactly as
+// download does. The returned digest is the SHA-256 of exactly what was
+// written to file.
+func (u *Updater) downloadToFile(ctx context.Context, rawURL string, limit int64, description string, total int64, file *os.File) ([sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
 	if err := u.validateURL(rawURL, false); err != nil {
-		return nil, fmt.Errorf("selfupdate: invalid %s URL: %w", description, err)
+		return zero, fmt.Errorf("selfupdate: invalid %s URL: %w", description, err)
 	}
 	downloadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	request, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("selfupdate: create %s request: %w", description, err)
+		return zero, fmt.Errorf("selfupdate: create %s request: %w", description, err)
 	}
 	request.Header.Set("Accept", "application/octet-stream")
 	request.Header.Set("User-Agent", "go-selfupdate")
@@ -230,13 +235,46 @@ func (u *Updater) download(ctx context.Context, rawURL string, limit int64, desc
 	}
 	timer := time.AfterFunc(u.downloadIdleTimeout, cancel)
 	defer timer.Stop()
-	wrap := func(reader io.Reader) io.Reader {
-		if u.downloadProgress != nil && total > 0 {
-			reader = &countingReader{reader: reader, total: total, report: u.downloadProgress}
-		}
-		return &idleTimeoutReader{reader: reader, timer: timer, idle: u.downloadIdleTimeout}
+
+	response, err := client.Do(request)
+	if err != nil {
+		return zero, fmt.Errorf("selfupdate: fetch %s: %w", description, err)
 	}
-	return u.doWithClient(&client, request, limit, description, wrap)
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		message, readErr := io.ReadAll(io.LimitReader(response.Body, maxErrorBytes+1))
+		if readErr != nil {
+			return zero, fmt.Errorf("selfupdate: fetch %s: HTTP %d (read error: %v)", description, response.StatusCode, readErr)
+		}
+		if int64(len(message)) > maxErrorBytes {
+			message = message[:maxErrorBytes]
+		}
+		text := strings.TrimSpace(string(message))
+		if text == "" {
+			text = response.Status
+		}
+		return zero, fmt.Errorf("selfupdate: fetch %s: HTTP %d: %s", description, response.StatusCode, text)
+	}
+	if response.ContentLength > limit {
+		return zero, fmt.Errorf("selfupdate: %s Content-Length %d exceeds the %d-byte limit", description, response.ContentLength, limit)
+	}
+	var bodyReader io.Reader = response.Body
+	if u.downloadProgress != nil && total > 0 {
+		bodyReader = &countingReader{reader: bodyReader, total: total, report: u.downloadProgress}
+	}
+	bodyReader = &idleTimeoutReader{reader: bodyReader, timer: timer, idle: u.downloadIdleTimeout}
+
+	hash := sha256.New()
+	written, err := io.Copy(io.MultiWriter(file, hash), io.LimitReader(bodyReader, limit+1))
+	if err != nil {
+		return zero, fmt.Errorf("selfupdate: read %s: %w", description, err)
+	}
+	if written > limit {
+		return zero, fmt.Errorf("selfupdate: %s exceeds the %d-byte limit", description, limit)
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest, nil
 }
 
 func (u *Updater) doWithClient(client *http.Client, request *http.Request, limit int64, description string, wrap func(io.Reader) io.Reader) ([]byte, error) {
