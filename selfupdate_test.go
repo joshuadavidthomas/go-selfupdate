@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -662,6 +663,50 @@ func TestNewCopiesHTTPClient(t *testing.T) {
 	defaultClient := mustUpdater(t, "v1.0.0")
 	if defaultClient.httpClient.Timeout != 60*time.Second {
 		t.Fatalf("default u.httpClient.Timeout = %v, want 60s", defaultClient.httpClient.Timeout)
+	}
+}
+
+func TestExtractTarGzRejectsOversizedExpansion(t *testing.T) {
+	var output bytes.Buffer
+	gzipWriter, err := gzip.NewWriterLevel(&output, gzip.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tarWriter := tar.NewWriter(gzipWriter)
+	size := maxExpandedArchiveBytes + (1 << 20) // 1 MiB over the limit
+	if err := tarWriter.WriteHeader(&tar.Header{Name: "filler", Mode: 0o644, Size: size, Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 8<<20) // zeros compress to almost nothing
+	for written := int64(0); written < size; {
+		n := int64(len(chunk))
+		if remaining := size - written; remaining < n {
+			n = remaining
+		}
+		if _, err := tarWriter.Write(chunk[:n]); err != nil {
+			t.Fatal(err)
+		}
+		written += n
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := extractTarGzContext(context.Background(), output.Bytes(), "tool")
+	if got != nil {
+		t.Fatalf("extractTarGzContext returned data %q, want nil", got)
+	}
+	// For a single oversized skipped member, tar.Reader's internal skip logic
+	// consumes the LimitedReader's remaining budget and surfaces the shortfall
+	// itself as io.ErrUnexpectedEOF before the loop ever reaches the post-loop
+	// "expanded archive exceeds" check. That explicit check remains as a
+	// backstop for archive layouts that exhaust the budget exactly on a tar
+	// block boundary (e.g. multiple members), so either error shape is a
+	// correct rejection of the oversized archive.
+	if err == nil || !(errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(err.Error(), "expanded archive exceeds")) {
+		t.Fatalf("extractTarGzContext error = %v, want io.ErrUnexpectedEOF or \"expanded archive exceeds\"", err)
 	}
 }
 
