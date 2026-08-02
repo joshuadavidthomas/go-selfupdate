@@ -492,12 +492,22 @@ func (p *Plan) CurrentVersion() string {
 	return p.currentVersion
 }
 
-// AvailableVersion returns the latest stable release version.
+// AvailableVersion returns the plan's stable release version: the latest
+// release for plans from Check, or the targeted release for plans from
+// CheckVersion.
 func (p *Plan) AvailableVersion() string {
 	if p == nil {
 		return ""
 	}
 	return p.availableVersion
+}
+
+// AssetName returns the name of the release asset selected for this platform.
+func (p *Plan) AssetName() string {
+	if p == nil {
+		return ""
+	}
+	return p.assetName
 }
 
 // VersionsComparable reports whether CurrentVersion is an exact stable version
