@@ -309,7 +309,10 @@ func TestApplySweepsStaleStagedExecutables(t *testing.T) {
 
 	matching := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("a", 32))
 	tooShort := filepath.Join(directory, ".tool.selfupdate-stage-abc")
-	wrongCase := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("A", 32))
+	// Uppercase hex fails the lower-hex matcher; use "F" rather than "A" so the
+	// name still differs from the matching fixture on case-insensitive
+	// filesystems (macOS, Windows), where "a"*32 and "A"*32 would collide.
+	wrongCase := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("F", 32))
 	unrelated := filepath.Join(directory, ".tool.other")
 	for _, path := range []string{matching, tooShort, wrongCase, unrelated} {
 		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
