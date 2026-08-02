@@ -3,7 +3,17 @@ name: test
 on:
   push:
     branches: [main]
+    paths:
+      - "**/*.go"
+      - .github/workflows/test.yml
+      - go.mod
+      - go.sum
   pull_request:
+    paths:
+      - "**/*.go"
+      - .github/workflows/test.yml
+      - go.mod
+      - go.sum
 
 permissions:
   contents: read
@@ -30,4 +40,4 @@ jobs:
           go-version-file: go.mod
 
       - name: Run tests
-        run: go test ./... -race
+        run: go test ./... -race -v

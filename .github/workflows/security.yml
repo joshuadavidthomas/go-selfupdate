@@ -3,7 +3,19 @@ name: security
 on:
   push:
     branches: [main]
+    paths:
+      - "**/*.go"
+      - .github/workflows/security.yml
+      - go.mod
+      - go.sum
+      - mise.toml
   pull_request:
+    paths:
+      - "**/*.go"
+      - .github/workflows/security.yml
+      - go.mod
+      - go.sum
+      - mise.toml
 
 permissions:
   contents: read
