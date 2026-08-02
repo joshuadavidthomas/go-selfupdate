@@ -20,8 +20,6 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/snappy"
-	"github.com/sigstore/sigstore-go/pkg/root"
-	sigstoretest "github.com/sigstore/sigstore-go/pkg/testing/data"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -34,18 +32,18 @@ type stubAttestationVerifier struct {
 	mu       sync.Mutex
 	calls    int
 	bundles  [][]byte
-	policies []attestationVerificationPolicy
-	verify   func(context.Context, []byte, attestationVerificationPolicy) error
+	requests []AttestationRequest
+	verify   func(context.Context, []byte, AttestationRequest) error
 }
 
-func (v *stubAttestationVerifier) Verify(ctx context.Context, bundle []byte, policy attestationVerificationPolicy) error {
+func (v *stubAttestationVerifier) VerifyAttestation(ctx context.Context, bundle []byte, request AttestationRequest) error {
 	v.mu.Lock()
 	v.calls++
 	v.bundles = append(v.bundles, bytes.Clone(bundle))
-	v.policies = append(v.policies, policy)
+	v.requests = append(v.requests, request)
 	v.mu.Unlock()
 	if v.verify != nil {
-		return v.verify(ctx, bundle, policy)
+		return v.verify(ctx, bundle, request)
 	}
 	return nil
 }
@@ -65,7 +63,7 @@ type attestationTestServer struct {
 	bundleBodies        map[string][]byte
 }
 
-func newAttestationTestServer(t *testing.T, policy *AttestationPolicy, token string, verifier attestationVerifier, attestationHandler http.HandlerFunc) *attestationTestServer {
+func newAttestationTestServer(t *testing.T, policy *AttestationPolicy, token string, verifier AttestationVerifier, attestationHandler http.HandlerFunc) *attestationTestServer {
 	t.Helper()
 	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
 	fixture := &attestationTestServer{
@@ -100,6 +98,9 @@ func newAttestationTestServer(t *testing.T, policy *AttestationPolicy, token str
 	}))
 	t.Cleanup(fixture.server.Close)
 
+	if policy != nil {
+		policy.Verifier = verifier
+	}
 	u, err := New(Config{
 		Repository: "owner/repo", Command: "tool", CurrentVersion: "v1.0.0",
 		GitHubToken: token, Attestation: policy,
@@ -120,9 +121,6 @@ func newAttestationTestServer(t *testing.T, policy *AttestationPolicy, token str
 	u.attestationBundleHost = serverURL.Hostname()
 	u.goos, u.goarch = "linux", "amd64"
 	u.executablePath = func() (string, error) { return target, nil }
-	if verifier != nil {
-		u.attestationVerifier = verifier
-	}
 	fixture.updater = u
 	return fixture
 }
@@ -208,14 +206,14 @@ func TestCheckAttestationRequestAndVerifiedPlan(t *testing.T) {
 		t.Fatalf("verifier calls = %d", verifier.callCount())
 	}
 	verifier.mu.Lock()
-	gotPolicy := verifier.policies[0]
+	gotRequest := verifier.requests[0]
 	verifier.mu.Unlock()
 	wantIdentity := "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v2.0.0"
-	if gotPolicy.identity != wantIdentity || gotPolicy.issuer != attestationIssuer || gotPolicy.predicate != attestationPredicate || gotPolicy.assetName != "tool_linux_amd64.tar.gz" || gotPolicy.digest != fixture.archiveDigest {
-		t.Fatalf("verification policy = %#v", gotPolicy)
+	if gotRequest.SignerIdentity != wantIdentity || gotRequest.Issuer != attestationIssuer || gotRequest.PredicateType != attestationPredicate || gotRequest.AssetName != "tool_linux_amd64.tar.gz" || gotRequest.DigestSHA256 != fixture.archiveDigest {
+		t.Fatalf("verification request = %#v", gotRequest)
 	}
-	if gotPolicy.sourceRepository != "https://github.com/owner/repo" || gotPolicy.sourceOwner != "https://github.com/owner" {
-		t.Fatalf("verification policy source repository/owner = %q, %q", gotPolicy.sourceRepository, gotPolicy.sourceOwner)
+	if gotRequest.SourceRepository != "https://github.com/owner/repo" || gotRequest.SourceOwner != "https://github.com/owner" {
+		t.Fatalf("verification request source repository/owner = %q, %q", gotRequest.SourceRepository, gotRequest.SourceOwner)
 	}
 }
 
@@ -223,7 +221,7 @@ func TestCheckAttestationFailuresPrecedeArchiveDownload(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		handler http.HandlerFunc
-		verify  func(context.Context, []byte, attestationVerificationPolicy) error
+		verify  func(context.Context, []byte, AttestationRequest) error
 		want    string
 	}{
 		{
@@ -253,7 +251,7 @@ func TestCheckAttestationFailuresPrecedeArchiveDownload(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				writeAttestations(t, w, []githubAttestation{{BundleURL: "http://" + r.Host + "/blob"}})
 			},
-			verify: func(context.Context, []byte, attestationVerificationPolicy) error {
+			verify: func(context.Context, []byte, AttestationRequest) error {
 				return errors.New("signature rejected")
 			},
 			want: "signature rejected",
@@ -308,7 +306,7 @@ func TestCheckAttestationCancellation(t *testing.T) {
 }
 
 func TestCheckAcceptsValidAttestationAmongUnrelatedBundles(t *testing.T) {
-	verifier := &stubAttestationVerifier{verify: func(_ context.Context, bundle []byte, _ attestationVerificationPolicy) error {
+	verifier := &stubAttestationVerifier{verify: func(_ context.Context, bundle []byte, _ AttestationRequest) error {
 		if bytes.Contains(bundle, []byte(`"valid"`)) {
 			return nil
 		}
@@ -529,128 +527,4 @@ func TestApplyRequiresMatchingProvenanceBeforeDownload(t *testing.T) {
 	if fixture.archiveRequests.Load() != 0 {
 		t.Fatalf("archive requests = %d", fixture.archiveRequests.Load())
 	}
-}
-
-func TestBuildCertificateIdentity(t *testing.T) {
-	t.Parallel()
-	t.Run("happy path", func(t *testing.T) {
-		t.Parallel()
-		policy := attestationVerificationPolicy{
-			identity:         "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v1.0.0",
-			issuer:           attestationIssuer,
-			sourceRepository: "https://github.com/owner/repo",
-			sourceOwner:      "https://github.com/owner",
-		}
-		identity, err := buildCertificateIdentity(policy)
-		if err != nil {
-			t.Fatalf("buildCertificateIdentity: %v", err)
-		}
-		if identity.SubjectAlternativeName.SubjectAlternativeName != policy.identity {
-			t.Errorf("SAN = %q, want %q", identity.SubjectAlternativeName.SubjectAlternativeName, policy.identity)
-		}
-		if identity.Issuer.Issuer != policy.issuer {
-			t.Errorf("issuer = %q, want %q", identity.Issuer.Issuer, policy.issuer)
-		}
-		if identity.SourceRepositoryURI != policy.sourceRepository {
-			t.Errorf("source repository = %q, want %q", identity.SourceRepositoryURI, policy.sourceRepository)
-		}
-		if identity.SourceRepositoryOwnerURI != policy.sourceOwner {
-			t.Errorf("source owner = %q, want %q", identity.SourceRepositoryOwnerURI, policy.sourceOwner)
-		}
-	})
-
-	t.Run("empty identity", func(t *testing.T) {
-		t.Parallel()
-		_, err := buildCertificateIdentity(attestationVerificationPolicy{issuer: attestationIssuer})
-		if err == nil {
-			t.Fatal("buildCertificateIdentity accepted an empty identity")
-		}
-	})
-
-	t.Run("empty issuer", func(t *testing.T) {
-		t.Parallel()
-		_, err := buildCertificateIdentity(attestationVerificationPolicy{
-			identity: "https://github.com/owner/repo/.github/workflows/release.yml@refs/tags/v1.0.0",
-		})
-		if err == nil {
-			t.Fatal("buildCertificateIdentity accepted an empty issuer")
-		}
-	})
-}
-
-func TestSigstoreTrustedRootInitializationRetriesAfterFailure(t *testing.T) {
-	entity := sigstoretest.Bundle(t, "othername.sigstore.json")
-	bundleJSON, err := entity.MarshalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	trustedRoot := sigstoretest.TrustedRoot(t, "scaffolding.json")
-	var fetches atomic.Int32
-	verifier := &sigstoreAttestationVerifier{fetchTrustedRoot: func() (root.TrustedMaterial, error) {
-		if fetches.Add(1) == 1 {
-			return nil, errors.New("temporary failure")
-		}
-		return trustedRoot, nil
-	}}
-	digestBytes, err := hex.DecodeString("bc103b4a84971ef6459b294a2b98568a2bfb72cded09d4acd1e16366a401f95b")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var digest [sha256.Size]byte
-	copy(digest[:], digestBytes)
-	policy := attestationVerificationPolicy{
-		issuer: "http://oidc.local:8080", identity: "foo!oidc.local",
-		predicate: attestationPredicate, assetName: "artifact", digest: digest,
-	}
-	if err := verifier.Verify(context.Background(), bundleJSON, policy); err == nil || !strings.Contains(err.Error(), "temporary failure") {
-		t.Fatalf("first Verify error = %v", err)
-	}
-	if err := verifier.Verify(context.Background(), bundleJSON, policy); err == nil || !strings.Contains(err.Error(), "not an in-toto Statement v1") {
-		t.Fatalf("second Verify error = %v", err)
-	}
-	if fetches.Load() != 2 {
-		t.Fatalf("trusted root fetches = %d", fetches.Load())
-	}
-}
-
-func TestSigstoreAttestationVerifierRejectsParsingAndPolicyFailures(t *testing.T) {
-	t.Run("parse before trusted root fetch", func(t *testing.T) {
-		var fetches atomic.Int32
-		verifier := &sigstoreAttestationVerifier{fetchTrustedRoot: func() (root.TrustedMaterial, error) {
-			fetches.Add(1)
-			return nil, errors.New("must not fetch")
-		}}
-		err := verifier.Verify(context.Background(), []byte(`{"bad":true}`), attestationVerificationPolicy{})
-		if err == nil || !strings.Contains(err.Error(), "parse Sigstore bundle") {
-			t.Fatalf("Verify error = %v", err)
-		}
-		if fetches.Load() != 0 {
-			t.Fatalf("trusted root fetches = %d", fetches.Load())
-		}
-	})
-
-	t.Run("actual cryptography then statement policy", func(t *testing.T) {
-		entity := sigstoretest.Bundle(t, "othername.sigstore.json")
-		bundleJSON, err := entity.MarshalJSON()
-		if err != nil {
-			t.Fatal(err)
-		}
-		trustedRoot := sigstoretest.TrustedRoot(t, "scaffolding.json")
-		verifier := &sigstoreAttestationVerifier{fetchTrustedRoot: func() (root.TrustedMaterial, error) {
-			return trustedRoot, nil
-		}}
-		digestBytes, err := hex.DecodeString("bc103b4a84971ef6459b294a2b98568a2bfb72cded09d4acd1e16366a401f95b")
-		if err != nil {
-			t.Fatal(err)
-		}
-		var digest [sha256.Size]byte
-		copy(digest[:], digestBytes)
-		err = verifier.Verify(context.Background(), bundleJSON, attestationVerificationPolicy{
-			issuer: "http://oidc.local:8080", identity: "foo!oidc.local",
-			predicate: attestationPredicate, assetName: "artifact", digest: digest,
-		})
-		if err == nil || !strings.Contains(err.Error(), "not an in-toto Statement v1") {
-			t.Fatalf("Verify error = %v", err)
-		}
-	})
 }
