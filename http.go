@@ -43,6 +43,7 @@ type releaseAsset struct {
 	name        string
 	downloadURL string
 	digest      [sha256.Size]byte
+	size        int64
 }
 
 func (u *Updater) fetchLatestRelease(ctx context.Context, expectedAsset string) (Release, releaseAsset, error) {
@@ -113,7 +114,7 @@ func (u *Updater) fetchLatestRelease(ctx context.Context, expectedAsset string) 
 		if err != nil {
 			return Release{}, releaseAsset{}, fmt.Errorf("selfupdate: invalid digest for asset %q: %w", asset.Name, err)
 		}
-		selected = releaseAsset{name: asset.Name, downloadURL: asset.DownloadURL, digest: digest}
+		selected = releaseAsset{name: asset.Name, downloadURL: asset.DownloadURL, digest: digest, size: asset.Size}
 	}
 	if selected.name == "" {
 		return Release{}, releaseAsset{}, fmt.Errorf("selfupdate: release %s has no exact asset %q", metadata.TagName, expectedAsset)
@@ -185,7 +186,29 @@ func (r *idleTimeoutReader) Read(buffer []byte) (int, error) {
 	return n, err
 }
 
-func (u *Updater) download(ctx context.Context, rawURL string, limit int64, description string) ([]byte, error) {
+// countingReader wraps a reader, invoking report with the cumulative byte
+// count after each successful read.
+type countingReader struct {
+	reader   io.Reader
+	received int64
+	total    int64
+	report   func(received, total int64)
+}
+
+func (r *countingReader) Read(buffer []byte) (int, error) {
+	n, err := r.reader.Read(buffer)
+	if n > 0 {
+		r.received += int64(n)
+		r.report(r.received, r.total)
+	}
+	return n, err
+}
+
+// download fetches rawURL, reporting cumulative progress against total
+// through u.downloadProgress when both are set. total is the release asset
+// size pinned by Check; callers with no known total (or no progress
+// consumer) pass 0, which disables progress reporting for that call.
+func (u *Updater) download(ctx context.Context, rawURL string, limit int64, description string, total int64) ([]byte, error) {
 	if err := u.validateURL(rawURL, false); err != nil {
 		return nil, fmt.Errorf("selfupdate: invalid %s URL: %w", description, err)
 	}
@@ -208,6 +231,9 @@ func (u *Updater) download(ctx context.Context, rawURL string, limit int64, desc
 	timer := time.AfterFunc(u.downloadIdleTimeout, cancel)
 	defer timer.Stop()
 	wrap := func(reader io.Reader) io.Reader {
+		if u.downloadProgress != nil && total > 0 {
+			reader = &countingReader{reader: reader, total: total, report: u.downloadProgress}
+		}
 		return &idleTimeoutReader{reader: reader, timer: timer, idle: u.downloadIdleTimeout}
 	}
 	return u.doWithClient(&client, request, limit, description, wrap)

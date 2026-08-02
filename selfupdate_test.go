@@ -831,6 +831,57 @@ func TestApplyDownloadHonorsCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestApplyReportsDownloadProgress(t *testing.T) {
+	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new-command-body")}})
+	fixture := releaseFixture{tag: "v2.0.0", assetName: "tool_linux_amd64.tar.gz", archive: archive}
+	u, server, _ := newTestUpdater(t, fixture, "v1.0.0")
+	defer server.Close()
+
+	type sample struct{ received, total int64 }
+	var mu sync.Mutex
+	var samples []sample
+	u.downloadProgress = func(received, total int64) {
+		mu.Lock()
+		samples = append(samples, sample{received, total})
+		mu.Unlock()
+	}
+
+	plan, err := u.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+
+	mu.Lock()
+	afterCheck := len(samples)
+	mu.Unlock()
+	if afterCheck != 0 {
+		t.Fatalf("progress calls observed during Check = %d, want 0", afterCheck)
+	}
+
+	if _, err := u.Apply(context.Background(), plan); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(samples) == 0 {
+		t.Fatal("no progress calls during Apply")
+	}
+	var previous int64
+	for _, s := range samples {
+		if s.received < previous {
+			t.Fatalf("received went backwards: %d then %d", previous, s.received)
+		}
+		if s.total != int64(len(archive)) {
+			t.Fatalf("total = %d, want %d", s.total, len(archive))
+		}
+		previous = s.received
+	}
+	if samples[len(samples)-1].received != int64(len(archive)) {
+		t.Fatalf("final received = %d, want %d", samples[len(samples)-1].received, len(archive))
+	}
+}
+
 func TestConcurrentApplyUsesFileLock(t *testing.T) {
 	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
 	var active atomic.Int32
