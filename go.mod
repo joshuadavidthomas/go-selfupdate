@@ -1,6 +1,6 @@
 module github.com/joshuadavidthomas/go-selfupdate
 
-go 1.26.5
+go 1.26
 
 require (
 	github.com/klauspost/compress v1.19.1

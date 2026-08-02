@@ -12,7 +12,7 @@ It supports Linux, macOS, and Windows on `amd64` and `arm64`. Your CLI decides w
 go get github.com/joshuadavidthomas/go-selfupdate
 ```
 
-The module requires Go 1.26.5 or later.
+The module requires Go 1.26 or later.
 
 ## Quick start
 
