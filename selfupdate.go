@@ -68,6 +68,12 @@ type Config struct {
 	// A nil policy keeps digest-only verification and makes no attestation API
 	// requests.
 	Attestation *AttestationPolicy
+	// DownloadProgress, if non-nil, is called synchronously from Apply as release
+	// asset bytes arrive: received is cumulative bytes read so far and total is
+	// the asset size from the release metadata. It is called from the goroutine
+	// running Apply, may be called many times, and must return promptly. It is
+	// never called by Check, and receives no call after the download completes.
+	DownloadProgress func(received, total int64)
 }
 
 // Updater checks and installs releases for one configured program.
@@ -87,6 +93,7 @@ type Updater struct {
 	attestationBundleHost string
 	allowHTTP             bool
 	downloadIdleTimeout   time.Duration
+	downloadProgress      func(received, total int64)
 	goos                  string
 	goarch                string
 	executablePath        func() (string, error)
@@ -105,6 +112,7 @@ type Plan struct {
 	release          Release
 	assetName        string
 	assetURL         string
+	assetSize        int64
 	archiveDigest    [sha256.Size]byte
 	provenance       *provenanceRecord
 	executable       string
@@ -197,6 +205,7 @@ func New(config Config) (*Updater, error) {
 		apiBaseURL:            defaultAPIBaseURL,
 		attestationBundleHost: attestationBundleHost,
 		downloadIdleTimeout:   defaultDownloadIdleTimeout,
+		downloadProgress:      config.DownloadProgress,
 		goos:                  runtime.GOOS,
 		goarch:                runtime.GOARCH,
 		executablePath:        os.Executable,
@@ -258,6 +267,7 @@ func (u *Updater) Check(ctx context.Context) (*Plan, error) {
 		release:          release,
 		assetName:        asset.name,
 		assetURL:         asset.downloadURL,
+		assetSize:        asset.size,
 		archiveDigest:    asset.digest,
 		provenance:       provenance,
 		executable:       executable,
@@ -337,7 +347,7 @@ func (u *Updater) Apply(ctx context.Context, plan *Plan) (result Result, returnE
 	if currentHash != plan.executableHash {
 		return Result{}, errors.New("selfupdate: executable changed since Check")
 	}
-	archiveBody, err := u.download(ctx, plan.assetURL, maxArchiveBytes, "release asset")
+	archiveBody, err := u.download(ctx, plan.assetURL, maxArchiveBytes, "release asset", plan.assetSize)
 	if err != nil {
 		return Result{}, err
 	}
