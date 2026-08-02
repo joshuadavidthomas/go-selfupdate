@@ -23,6 +23,7 @@ and this project attempts to adhere to [Semantic Versioning](https://semver.org/
 ### Added
 
 - Targeted stable-release installation with `CheckVersion` and an explicit `Config.AllowDowngrade` opt-in for reinstalls and downgrades.
+- `Plan.AssetName` reports the release asset selected for the running platform.
 
 ## [0.1.0]
 

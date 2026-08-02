@@ -107,6 +107,12 @@ func TestCheckSelectsExactStableRelease(t *testing.T) {
 	if plan.CurrentVersion() != "v1.0.0" || plan.AvailableVersion() != "v2.0.0" || !plan.VersionsComparable() || !plan.UpdateAvailable() {
 		t.Fatalf("unexpected plan: current=%q available=%q comparable=%v update=%v", plan.CurrentVersion(), plan.AvailableVersion(), plan.VersionsComparable(), plan.UpdateAvailable())
 	}
+	if plan.AssetName() != "tool_linux_amd64.tar.gz" {
+		t.Fatalf("unexpected asset name %q", plan.AssetName())
+	}
+	if (*Plan)(nil).AssetName() != "" {
+		t.Fatal("nil plan AssetName should be empty")
+	}
 	release := plan.Release()
 	if release.Version != "v2.0.0" || release.Name != "Release v2.0.0" || release.Notes != "notes" || release.URL == "" || release.PublishedAt.IsZero() {
 		t.Fatalf("unexpected release metadata: %#v", release)
