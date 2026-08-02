@@ -111,15 +111,6 @@ func randomBackupPath(target string) (string, error) {
 	return "", errors.New("could not create a unique backup name")
 }
 
-func isLowerHex(value string) bool {
-	for _, character := range value {
-		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
-			return false
-		}
-	}
-	return true
-}
-
 func isPendingCleanupError(err error) bool {
 	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED)
 }

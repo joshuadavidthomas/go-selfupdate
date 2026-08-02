@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -269,6 +270,99 @@ func TestApplyVerifiesAndReplacesOnlyCommand(t *testing.T) {
 		if info.Mode().Perm() != 0o750 {
 			t.Fatalf("mode = %o", info.Mode().Perm())
 		}
+	}
+}
+
+func TestStageExecutableModeAppliedAfterWrite(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "tool")
+	if err := os.WriteFile(target, []byte("old"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path, err := stageExecutable(context.Background(), target, []byte("new-binary"), 0o755)
+	if err != nil {
+		t.Fatalf("stageExecutable: %v", err)
+	}
+	defer func() { _ = os.Remove(path) }()
+
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o755 {
+			t.Fatalf("mode = %o, want 0755", info.Mode().Perm())
+		}
+	}
+
+	pattern := regexp.MustCompile(`^\.` + regexp.QuoteMeta(filepath.Base(target)) + `\.selfupdate-stage-[0-9a-f]{32}$`)
+	if !pattern.MatchString(filepath.Base(path)) {
+		t.Fatalf("stage name %q does not match %s", filepath.Base(path), pattern)
+	}
+}
+
+func TestApplySweepsStaleStagedExecutables(t *testing.T) {
+	archive := makeTar(t, []archiveMember{{name: "tool", body: []byte("new")}})
+	fixture := releaseFixture{tag: "v2.0.0", assetName: "tool_linux_amd64.tar.gz", archive: archive}
+	u, server, target := newTestUpdater(t, fixture, "v1.0.0")
+	defer server.Close()
+	directory := filepath.Dir(target)
+
+	matching := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("a", 32))
+	tooShort := filepath.Join(directory, ".tool.selfupdate-stage-abc")
+	// Uppercase hex fails the lower-hex matcher; use "F" rather than "A" so the
+	// name still differs from the matching fixture on case-insensitive
+	// filesystems (macOS, Windows), where "a"*32 and "A"*32 would collide.
+	wrongCase := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("F", 32))
+	unrelated := filepath.Join(directory, ".tool.other")
+	for _, path := range []string{matching, tooShort, wrongCase, unrelated} {
+		if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan, err := u.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if _, err := u.Apply(context.Background(), plan); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if _, err := os.Stat(matching); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale stage still exists (stat err = %v)", err)
+	}
+	for _, path := range []string{tooShort, wrongCase, unrelated} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("near-miss %s was removed: %v", path, err)
+		}
+	}
+}
+
+func TestCleanupStaleStagesSkipsSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinked stage names are a Unix-only concern")
+	}
+	directory := t.TempDir()
+	target := filepath.Join(directory, "tool")
+
+	victimDir := t.TempDir()
+	victim := filepath.Join(victimDir, "victim")
+	if err := os.WriteFile(victim, []byte("victim"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlinkPath := filepath.Join(directory, ".tool.selfupdate-stage-"+strings.Repeat("a", 32))
+	if err := os.Symlink(victim, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanupStaleStages(target); err != nil {
+		t.Fatalf("cleanupStaleStages: %v", err)
+	}
+	if _, err := os.Lstat(symlinkPath); err != nil {
+		t.Fatalf("symlink removed: %v", err)
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("victim removed: %v", err)
 	}
 }
 

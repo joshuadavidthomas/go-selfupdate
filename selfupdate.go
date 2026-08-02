@@ -317,6 +317,9 @@ func (u *Updater) Apply(ctx context.Context, plan *Plan) (result Result, returnE
 	if err != nil {
 		return Result{}, fmt.Errorf("selfupdate: clean stale backups: %w", err)
 	}
+	if err := cleanupStaleStages(target); err != nil {
+		return Result{}, fmt.Errorf("selfupdate: clean stale staged executables: %w", err)
+	}
 	currentHash, mode, err := hashExecutable(ctx, target)
 	if err != nil {
 		return Result{}, err
