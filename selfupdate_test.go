@@ -670,7 +670,7 @@ func TestApplyDownloadStallAborts(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		if err == nil || !(errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context")) {
+		if err == nil || (!errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context")) {
 			t.Fatalf("Apply error = %v, want context.Canceled or a \"context\" error", err)
 		}
 	case <-time.After(5 * time.Second):
