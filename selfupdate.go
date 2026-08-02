@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	defaultAPIBaseURL = "https://api.github.com"
-	defaultTimeout    = 60 * time.Second
+	defaultAPIBaseURL          = "https://api.github.com"
+	defaultTimeout             = 60 * time.Second
+	defaultDownloadIdleTimeout = 30 * time.Second
 )
 
 var (
@@ -50,7 +51,9 @@ type Config struct {
 	CurrentVersion string
 	// HTTPClient is the client used for GitHub API and asset requests. New uses
 	// a shallow copy of a non-nil client. A nil client selects a default client
-	// with a 60-second timeout.
+	// with a 60-second timeout. The client's Timeout applies to metadata and
+	// attestation requests; asset downloads ignore it and are instead bounded
+	// by the Check/Apply context plus a 30-second stall detector.
 	HTTPClient *http.Client
 	// GitHubToken is an optional bearer token used only for GitHub API
 	// requests. Asset, attestation bundle, and Sigstore trust downloads do not
@@ -78,6 +81,7 @@ type Updater struct {
 	apiBaseURL            string
 	attestationBundleHost string
 	allowHTTP             bool
+	downloadIdleTimeout   time.Duration
 	goos                  string
 	goarch                string
 	executablePath        func() (string, error)
@@ -182,6 +186,7 @@ func New(config Config) (*Updater, error) {
 		attestationVerifier:   &sigstoreAttestationVerifier{},
 		apiBaseURL:            defaultAPIBaseURL,
 		attestationBundleHost: attestationBundleHost,
+		downloadIdleTimeout:   defaultDownloadIdleTimeout,
 		goos:                  runtime.GOOS,
 		goarch:                runtime.GOARCH,
 		executablePath:        os.Executable,

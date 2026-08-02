@@ -148,7 +148,7 @@ The package leaves prompts, progress output, update schedules, install markers, 
 
 Unix replaces the target with one rename, then syncs the file and parent directory. Windows renames the old executable aside, installs the staged file, and restores the backup if installation fails. A running process may keep the old Windows executable open; in that case `CleanupPending` is true and a later update retries removal.
 
-Cancellation stops ordinary work until replacement begins. The bounded Sigstore TUF refresh described above may finish in the background. Replacement, rollback, and cleanup run to completion once replacement starts.
+Cancellation stops ordinary work until replacement begins. The bounded Sigstore TUF refresh described above may finish in the background. Replacement, rollback, and cleanup run to completion once replacement starts. Asset downloads are not subject to the HTTP client's overall timeout; they stop on context cancellation or after 30 seconds without progress.
 
 ## Security
 
