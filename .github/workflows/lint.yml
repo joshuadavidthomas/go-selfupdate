@@ -1,6 +1,7 @@
 name: lint
 
 on:
+  workflow_call:
   push:
     branches: [main]
     paths:
