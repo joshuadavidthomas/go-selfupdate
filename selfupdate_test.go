@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 type releaseFixture struct {
@@ -36,6 +38,8 @@ type releaseFixture struct {
 	duplicate    string
 	metadataCode int
 	metadataBody []byte
+	draft        bool
+	prerelease   bool
 	archiveHook  func()
 }
 
@@ -160,6 +164,158 @@ func TestCheckVersionBehavior(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCheckVersionAppliesTargetedNewer(t *testing.T) {
+	u, server, _ := newTestUpdater(t, releaseFixture{tag: "v2.0.0"}, "v1.0.0")
+	defer server.Close()
+
+	plan, err := u.CheckVersion(context.Background(), "v2.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := u.Apply(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Committed || result.Version != "v2.0.0" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestApplyRejectsTargetedDowngradeWithoutOptIn(t *testing.T) {
+	u, server, target := newTestUpdater(t, releaseFixture{tag: "v1.0.0"}, "v2.0.0")
+	defer server.Close()
+
+	plan, err := u.CheckVersion(context.Background(), "v1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := u.Apply(context.Background(), plan)
+	if err == nil || !strings.Contains(err.Error(), "AllowDowngrade") {
+		t.Fatalf("Apply error = %v, want AllowDowngrade error", err)
+	}
+	if result.Committed {
+		t.Fatalf("unexpected committed result: %#v", result)
+	}
+	body, readErr := os.ReadFile(target)
+	if readErr != nil || string(body) != "old" {
+		t.Fatalf("target changed: body=%q err=%v", body, readErr)
+	}
+}
+
+func TestApplyCommitsTargetedDowngradeWithOptIn(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		current string
+		target  string
+	}{
+		{name: "downgrade", current: "v2.0.0", target: "v1.0.0"},
+		{name: "equal-version reinstall", current: "v1.0.0", target: "v1.0.0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			u, server, _ := newTestUpdater(t, releaseFixture{tag: test.target}, test.current)
+			defer server.Close()
+			u.allowDowngrade = true
+
+			plan, err := u.CheckVersion(context.Background(), test.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := u.Apply(context.Background(), plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Committed || result.PreviousVersion != test.current || result.Version != test.target {
+				t.Fatalf("unexpected result: %#v", result)
+			}
+			if test.name == "downgrade" && semver.Compare(result.PreviousVersion, result.Version) <= 0 {
+				t.Fatalf("previous version %q is not greater than %q", result.PreviousVersion, result.Version)
+			}
+		})
+	}
+}
+
+func TestAllowDowngradeDoesNotRelaxLatestPath(t *testing.T) {
+	u, server, target := newTestUpdater(t, releaseFixture{tag: "v1.0.0"}, "v1.0.0")
+	defer server.Close()
+	u.allowDowngrade = true
+
+	plan, err := u.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := u.Apply(context.Background(), plan)
+	if err == nil {
+		t.Fatal("Apply accepted a non-newer latest-path plan")
+	}
+	if result.Committed {
+		t.Fatalf("unexpected committed result: %#v", result)
+	}
+	body, readErr := os.ReadFile(target)
+	if readErr != nil || string(body) != "old" {
+		t.Fatalf("target changed: body=%q err=%v", body, readErr)
+	}
+}
+
+func TestCheckVersionRejectsPrereleaseFlaggedRelease(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		fixture releaseFixture
+		flag    string
+	}{
+		{name: "prerelease", fixture: releaseFixture{tag: "v2.0.0", prerelease: true}, flag: "prerelease"},
+		{name: "draft", fixture: releaseFixture{tag: "v2.0.0", draft: true}, flag: "draft"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			u, server, _ := newTestUpdater(t, test.fixture, "v1.0.0")
+			defer server.Close()
+			_, err := u.CheckVersion(context.Background(), "v2.0.0")
+			if err == nil || !strings.Contains(err.Error(), test.flag) {
+				t.Fatalf("CheckVersion error = %v, want %q", err, test.flag)
+			}
+		})
+	}
+}
+
+func TestCheckVersionValidatesInput(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	u := mustUpdater(t, "v1.0.0")
+	u.apiBaseURL = server.URL
+	u.allowHTTP = true
+	for _, version := range []string{"1.2.3", "v1.2", "v1.2.3-rc1", "latest"} {
+		if _, err := u.CheckVersion(context.Background(), version); err == nil {
+			t.Errorf("CheckVersion accepted %q", version)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("invalid versions made %d HTTP requests", hits.Load())
+	}
+
+	mismatch, mismatchServer, _ := newTestUpdater(t, releaseFixture{tag: "v3.0.0"}, "v1.0.0")
+	defer mismatchServer.Close()
+	if _, err := mismatch.CheckVersion(context.Background(), "v2.0.0"); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("tag mismatch error = %v", err)
+	}
+}
+
+func TestApplyRejectsTargetedPlanOverDevelopmentBuild(t *testing.T) {
+	u, server, _ := newTestUpdater(t, releaseFixture{tag: "v2.0.0"}, "dev")
+	defer server.Close()
+	u.allowDowngrade = true
+
+	plan, err := u.CheckVersion(context.Background(), "v2.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.Apply(context.Background(), plan); err == nil || !strings.Contains(err.Error(), "not a stable version") {
+		t.Fatalf("Apply error = %v, want incomparable current-version error", err)
 	}
 }
 
@@ -1423,8 +1579,7 @@ func newTestUpdater(t *testing.T, fixture releaseFixture, current string) (*Upda
 	defaultDigest := fmt.Sprintf("sha256:%x", archiveHash)
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/repos/owner/repo/releases/latest":
+		if r.URL.Path == "/repos/owner/repo/releases/latest" || strings.HasPrefix(r.URL.Path, "/repos/owner/repo/releases/tags/") {
 			if fixture.metadataCode != 0 {
 				http.Error(w, "metadata failed", fixture.metadataCode)
 				return
@@ -1454,8 +1609,12 @@ func newTestUpdater(t *testing.T, fixture releaseFixture, current string) (*Upda
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"tag_name": fixture.tag, "name": "Release " + fixture.tag, "body": "notes",
-				"html_url": server.URL + "/release", "published_at": "2026-01-02T03:04:05Z", "assets": assets,
+				"html_url": server.URL + "/release", "published_at": "2026-01-02T03:04:05Z",
+				"draft": fixture.draft, "prerelease": fixture.prerelease, "assets": assets,
 			})
+			return
+		}
+		switch r.URL.Path {
 		case "/asset":
 			if fixture.archiveHook != nil {
 				fixture.archiveHook()

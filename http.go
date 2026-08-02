@@ -30,6 +30,8 @@ type githubRelease struct {
 	Body        string        `json:"body"`
 	HTMLURL     string        `json:"html_url"`
 	PublishedAt time.Time     `json:"published_at"`
+	Draft       bool          `json:"draft"`
+	Prerelease  bool          `json:"prerelease"`
 	Assets      []githubAsset `json:"assets"`
 }
 
@@ -47,7 +49,36 @@ type releaseAsset struct {
 	size        int64
 }
 
+type httpStatusError struct {
+	description string
+	statusCode  int
+	detail      string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("selfupdate: fetch %s: HTTP %d: %s", e.description, e.statusCode, e.detail)
+}
+
 func (u *Updater) fetchLatestRelease(ctx context.Context, expectedAsset string) (Release, releaseAsset, error) {
+	return u.fetchRelease(ctx, "releases/latest", expectedAsset)
+}
+
+func (u *Updater) fetchReleaseByTag(ctx context.Context, version, expectedAsset string) (Release, releaseAsset, error) {
+	release, asset, err := u.fetchRelease(ctx, "releases/tags/"+url.PathEscape(version), expectedAsset)
+	if err != nil {
+		var statusErr *httpStatusError
+		if errors.As(err, &statusErr) && statusErr.statusCode == http.StatusNotFound {
+			return Release{}, releaseAsset{}, fmt.Errorf("selfupdate: release %s not found: %w", version, err)
+		}
+		return Release{}, releaseAsset{}, err
+	}
+	if release.Version != version {
+		return Release{}, releaseAsset{}, fmt.Errorf("selfupdate: release tag %q does not match requested version %q", release.Version, version)
+	}
+	return release, asset, nil
+}
+
+func (u *Updater) fetchRelease(ctx context.Context, pathSuffix, expectedAsset string) (Release, releaseAsset, error) {
 	base, err := url.Parse(u.apiBaseURL)
 	if err != nil || !base.IsAbs() || base.Host == "" || base.RawQuery != "" || base.Fragment != "" || base.User != nil {
 		return Release{}, releaseAsset{}, errors.New("selfupdate: invalid GitHub API base URL")
@@ -55,7 +86,7 @@ func (u *Updater) fetchLatestRelease(ctx context.Context, expectedAsset string) 
 	if err := u.validateURL(base.String(), true); err != nil {
 		return Release{}, releaseAsset{}, err
 	}
-	base.Path = strings.TrimSuffix(base.Path, "/") + "/repos/" + url.PathEscape(u.owner) + "/" + url.PathEscape(u.repository) + "/releases/latest"
+	base.Path = strings.TrimSuffix(base.Path, "/") + "/repos/" + url.PathEscape(u.owner) + "/" + url.PathEscape(u.repository) + "/" + pathSuffix
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
 	if err != nil {
@@ -83,6 +114,12 @@ func (u *Updater) fetchLatestRelease(ctx context.Context, expectedAsset string) 
 	}
 	if err := ensureJSONEnd(decoder); err != nil {
 		return Release{}, releaseAsset{}, err
+	}
+	if metadata.Draft {
+		return Release{}, releaseAsset{}, errors.New("selfupdate: release metadata is flagged as draft")
+	}
+	if metadata.Prerelease {
+		return Release{}, releaseAsset{}, errors.New("selfupdate: release metadata is flagged as prerelease")
 	}
 	if !isStableVersion(metadata.TagName) {
 		return Release{}, releaseAsset{}, fmt.Errorf("selfupdate: latest release tag %q is not exact vMAJOR.MINOR.PATCH", metadata.TagName)
@@ -295,7 +332,7 @@ func (u *Updater) doWithClient(client *http.Client, request *http.Request, limit
 		if text == "" {
 			text = response.Status
 		}
-		return nil, fmt.Errorf("selfupdate: fetch %s: HTTP %d: %s", description, response.StatusCode, text)
+		return nil, &httpStatusError{description: description, statusCode: response.StatusCode, detail: text}
 	}
 	if response.ContentLength > limit {
 		return nil, fmt.Errorf("selfupdate: %s Content-Length %d exceeds the %d-byte limit", description, response.ContentLength, limit)

@@ -55,6 +55,13 @@ type Config struct {
 	// version, or an opaque value for a development or unknown build. Opaque
 	// versions support Check but cannot be installed over by Apply.
 	CurrentVersion string
+	// AllowDowngrade permits Apply to install a plan from CheckVersion whose
+	// version is equal to or older than CurrentVersion (reinstall or downgrade).
+	// It never affects plans from Check: the automatic latest-release path
+	// always requires a strictly newer version, which is the library's rollback
+	// defense. Downgrading reinstalls old code, including any vulnerabilities
+	// fixed since.
+	AllowDowngrade bool
 	// HTTPClient is the client used for GitHub API and asset requests. New uses
 	// a shallow copy of a non-nil client. A nil client selects a default client
 	// with a 60-second timeout. The client's Timeout applies to metadata and
@@ -84,6 +91,7 @@ type Updater struct {
 	command             string
 	currentVersion      string
 	currentStable       bool
+	allowDowngrade      bool
 	httpClient          *http.Client
 	githubToken         string
 	attestationWorkflow string
@@ -110,6 +118,7 @@ type Plan struct {
 	availableVersion string
 	comparable       bool
 	updateAvailable  bool
+	targeted         bool
 	release          Release
 	assetName        string
 	assetURL         string
@@ -199,6 +208,7 @@ func New(config Config) (*Updater, error) {
 		command:               command,
 		currentVersion:        config.CurrentVersion,
 		currentStable:         isStableVersion(config.CurrentVersion),
+		allowDowngrade:        config.AllowDowngrade,
 		httpClient:            client,
 		githubToken:           token,
 		attestationWorkflow:   attestationWorkflow,
@@ -235,7 +245,37 @@ func (u *Updater) Check(ctx context.Context) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	return u.buildPlan(ctx, release, asset, memberName, false)
+}
+
+// CheckVersion fetches the GitHub release with the exact stable tag version
+// and returns an immutable plan targeting it. The target may be older than,
+// equal to, or newer than CurrentVersion; Apply installs a non-newer target
+// only when Config.AllowDowngrade is set.
+func (u *Updater) CheckVersion(ctx context.Context, version string) (*Plan, error) {
+	if u == nil {
+		return nil, errors.New("selfupdate: nil updater")
+	}
+	if ctx == nil {
+		return nil, errors.New("selfupdate: nil context")
+	}
+	if !isStableVersion(version) {
+		return nil, fmt.Errorf("selfupdate: target version %q is not exact vMAJOR.MINOR.PATCH", version)
+	}
+	assetName, memberName, err := expectedNames(u.command, u.goos, u.goarch)
+	if err != nil {
+		return nil, err
+	}
+	release, asset, err := u.fetchReleaseByTag(ctx, version, assetName)
+	if err != nil {
+		return nil, err
+	}
+	return u.buildPlan(ctx, release, asset, memberName, true)
+}
+
+func (u *Updater) buildPlan(ctx context.Context, release Release, asset releaseAsset, memberName string, targeted bool) (*Plan, error) {
 	var provenance *provenanceRecord
+	var err error
 	if u.attestationWorkflow != "" {
 		provenance, err = u.verifyAttestation(ctx, release, asset)
 		if err != nil {
@@ -265,6 +305,7 @@ func (u *Updater) Check(ctx context.Context) (*Plan, error) {
 		availableVersion: release.Version,
 		comparable:       comparable,
 		updateAvailable:  available,
+		targeted:         targeted,
 		release:          release,
 		assetName:        asset.name,
 		assetURL:         asset.downloadURL,
@@ -297,8 +338,14 @@ func (u *Updater) Apply(ctx context.Context, plan *Plan) (result Result, returnE
 	if !u.currentStable || !plan.comparable {
 		return Result{}, fmt.Errorf("selfupdate: current version %q is not a stable version", u.currentVersion)
 	}
-	if !isStableVersion(plan.availableVersion) || semver.Compare(plan.currentVersion, plan.availableVersion) >= 0 || !plan.updateAvailable {
-		return Result{}, fmt.Errorf("selfupdate: release %q is not strictly newer than %q", plan.availableVersion, plan.currentVersion)
+	if !isStableVersion(plan.availableVersion) {
+		return Result{}, fmt.Errorf("selfupdate: release %q is not a stable version", plan.availableVersion)
+	}
+	newer := plan.updateAvailable && semver.Compare(plan.currentVersion, plan.availableVersion) < 0
+	// Keep the targeted opt-in visibly grouped as the sole non-newer exception.
+	//nolint:staticcheck // The explicit grouping mirrors the security invariant.
+	if !newer && !(plan.targeted && u.allowDowngrade) {
+		return Result{}, fmt.Errorf("selfupdate: release %q is not strictly newer than %q (targeted downgrades require AllowDowngrade)", plan.availableVersion, plan.currentVersion)
 	}
 	if plan.goos != u.goos || plan.goarch != u.goarch {
 		return Result{}, errors.New("selfupdate: plan platform does not match updater")

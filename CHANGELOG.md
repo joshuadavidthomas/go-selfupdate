@@ -20,6 +20,10 @@ and this project attempts to adhere to [Semantic Versioning](https://semver.org/
 
 ## [Unreleased]
 
+### Added
+
+- Targeted stable-release installation with `CheckVersion` and an explicit `Config.AllowDowngrade` opt-in for reinstalls and downgrades.
+
 ## [0.1.0]
 
 ### Added
