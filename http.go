@@ -145,6 +145,30 @@ func parseAssetDigest(value string) ([sha256.Size]byte, error) {
 	return digest, nil
 }
 
+// assetRedirectAllowed reports whether an asset-download redirect target is
+// acceptable: HTTPS only, no credentials or fragment, and a host that is
+// github.com or a *.githubusercontent.com asset host. allowHTTP relaxes the
+// scheme and host checks for loopback test servers, mirroring validateURL.
+func (u *Updater) assetRedirectAllowed(target *url.URL) error {
+	if target.User != nil || target.Fragment != "" {
+		return errors.New("selfupdate: unsafe release asset redirect rejected")
+	}
+	if u.allowHTTP {
+		if target.Scheme != "https" && target.Scheme != "http" {
+			return errors.New("selfupdate: unsafe release asset redirect rejected")
+		}
+		return nil
+	}
+	if target.Scheme != "https" || target.Port() != "" {
+		return errors.New("selfupdate: unsafe release asset redirect rejected")
+	}
+	host := strings.ToLower(target.Hostname())
+	if host != "github.com" && host != "githubusercontent.com" && !strings.HasSuffix(host, ".githubusercontent.com") {
+		return errors.New("selfupdate: release asset redirect to an untrusted host rejected")
+	}
+	return nil
+}
+
 func (u *Updater) download(ctx context.Context, rawURL string, limit int64, description string) ([]byte, error) {
 	if err := u.validateURL(rawURL, false); err != nil {
 		return nil, fmt.Errorf("selfupdate: invalid %s URL: %w", description, err)
@@ -155,11 +179,14 @@ func (u *Updater) download(ctx context.Context, rawURL string, limit int64, desc
 	}
 	request.Header.Set("Accept", "application/octet-stream")
 	request.Header.Set("User-Agent", "go-selfupdate")
-	return u.do(request, limit, description)
-}
-
-func (u *Updater) do(request *http.Request, limit int64, description string) ([]byte, error) {
-	return u.doWithClient(u.httpClient, request, limit, description)
+	client := *u.httpClient
+	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("selfupdate: too many release asset redirects")
+		}
+		return u.assetRedirectAllowed(request.URL)
+	}
+	return u.doWithClient(&client, request, limit, description)
 }
 
 func (u *Updater) doWithClient(client *http.Client, request *http.Request, limit int64, description string) ([]byte, error) {
